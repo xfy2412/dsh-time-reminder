@@ -2,10 +2,15 @@
  * Counter visibility across a Session lineage.
  *
  * A counter is visible to its own Session, and then to related Sessions only when
- * the counter opts in: ancestry is walked through `header.parentSession` up to the
- * configured depth, and descendants are found by scanning `ctx.sessions.list()`.
- * Nearest relation wins on a name collision, so a Session's own counter always
- * shadows an inherited one.
+ * the counter opts in, from the owner's point of view:
+ *
+ * - `toChildren` exposes it to Session**s delegated from the owner** (descendants),
+ * - `toParents` exposes it to the **owner's ancestors**,
+ *
+ * each within the counter's own `depth`. Ancestry is walked through
+ * `header.parentSession` up to that depth, and descendants are found by scanning
+ * `ctx.sessions.list()`. Nearest relation wins on a name collision, so a
+ * Session's own counter always shadows an inherited one.
  *
  * @module dsh-time-reminder/visibility
  */
@@ -53,8 +58,8 @@ export function visibleCounters(
     byName.set(counter.name, { counter, origin: 'own', distance: 0 })
   }
 
-  // Ancestors: a counter is visible here only when it opted into `toParents`, and
-  // only within its own `depth`.
+  // Ancestors: an ancestor's counter reaches this Session only when that counter
+  // opted into `toChildren` (the owner exposes it downward), within its own `depth`.
   let cursor = current.parentSession
   let distance = 1
   const all = source.list()
@@ -64,7 +69,7 @@ export function visibleCounters(
     const ancestorState = stateOf(cursor)
     if (ancestorState !== undefined) {
       for (const counter of ancestorState.counters) {
-        if (!counter.scope.toParents) continue
+        if (!counter.scope.toChildren) continue
         if (counter.scope.depth < distance) continue
         if (!byName.has(counter.name)) byName.set(counter.name, { counter, origin: 'ancestor', distance })
       }
@@ -74,14 +79,14 @@ export function visibleCounters(
     distance += 1
   }
 
-  // Descendants: expose a counter downward when it opted into `toChildren`, within
-  // its `depth`. Only Sessions in this Session's own subtree are considered.
+  // Descendants: a descendant's counter reaches this Session only when that counter
+  // opted into `toParents` (the owner exposes it upward), within its own `depth`.
   const descendants = descendantsOf(current.id, all)
   for (const descendant of descendants) {
     const descendantState = stateOf(descendant.id)
     if (descendantState === undefined) continue
     for (const counter of descendantState.counters) {
-      if (!counter.scope.toChildren) continue
+      if (!counter.scope.toParents) continue
       if (counter.scope.depth < descendant.distance) continue
       if (!byName.has(counter.name)) byName.set(counter.name, { counter, origin: 'descendant', distance: descendant.distance })
     }
@@ -109,4 +114,52 @@ function descendantsOf(rootId: string, all: readonly SessionFacts[]): { id: stri
     frontier = next
   }
   return found
+}
+
+/** One Session a counter reaches, with the relation that carries it. */
+export interface PushTarget {
+  readonly id: string
+  /** `ancestor` when the counter travels upward, `descendant` when it travels downward. */
+  readonly direction: 'ancestor' | 'descendant'
+  /** How many lineage steps away the target Session is. */
+  readonly distance: number
+}
+
+/**
+ * Sessions one counter reaches, per its own scope flags.
+ *
+ * This is the same relation `visibleCounters` resolves from the other side: a
+ * counter whose owner opted into `toChildren` reaches descendants within
+ * `depth`, and one opted into `toParents` reaches ancestors within `depth`.
+ * A caller that delivers a notice uses this to name its recipients; a missing
+ * relation (an ancestor the store no longer lists) ends the upward walk but is
+ * still reported, because residency decides deliverability, not identity.
+ *
+ * @param owner - the Session owning the counter.
+ * @param counter - the counter being announced.
+ * @param source - Session store used for ancestry and descent lookup.
+ * @returns the reachable Sessions, nearest first.
+ */
+export function pushTargets(owner: SessionFacts, counter: CounterRecord, source: LineageSource): PushTarget[] {
+  const targets: PushTarget[] = []
+  const all = source.list()
+  if (counter.scope.toParents) {
+    const byId = new Map(all.map((session) => [session.id, session]))
+    let cursor = owner.parentSession
+    let distance = 1
+    while (cursor !== undefined && distance <= counter.scope.depth && distance <= 64) {
+      targets.push({ id: cursor, direction: 'ancestor', distance })
+      const ancestor = byId.get(cursor)
+      if (ancestor === undefined) break
+      cursor = ancestor.parentSession
+      distance += 1
+    }
+  }
+  if (counter.scope.toChildren) {
+    for (const descendant of descendantsOf(owner.id, all)) {
+      if (descendant.distance > counter.scope.depth) break
+      targets.push({ id: descendant.id, direction: 'descendant', distance: descendant.distance })
+    }
+  }
+  return targets
 }

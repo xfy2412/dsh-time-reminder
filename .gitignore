@@ -1,3 +1,8 @@
+# Build output: `scripts/build.mjs` transpiles src/**.ts into lib/**.js, and the
+# DSH loader loads lib/ as plain Node ESM. Regenerate with `npm run build` before
+# installing into a profile; never edit lib/ by hand.
+lib/
+
 node_modules/
 *.log
 .DS_Store

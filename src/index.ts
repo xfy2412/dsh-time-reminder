@@ -8,9 +8,10 @@
  *   injects when a cron occurrence has been crossed, `fine` injects every step);
  * - `time_mode` and `time_counter` tools, which stay available in every mode.
  *
- * Per-Session state is committed as `time-reminder/state` events carrying the whole
- * state, so the projection is rebuilt by folding the log and both the mode and the
- * injection history survive a Session restore.
+ * Per-Session state (mode, schedule, counters, reading history) is **folded from
+ * the Session log** rather than written as a plugin-owned event: DSH has no
+ * public API that marks an event `ignorable`, and a log carrying an unknown
+ * event type without that marker is refused on reload. See `./state.ts`.
  *
  * @module dsh-time-reminder
  */
@@ -19,44 +20,35 @@ import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { Context } from '@deepseek-ai/cordis'
-import { assertNever } from '@deepseek-ai/dsh-util-values'
 import {
   canonicalTimeZone,
+  counterNoticeText,
   cronDue,
   describeSchedule,
   formatDuration,
   formatTimestamp,
+  readingSummary,
   renderReading,
-  type TimeMode,
+  systemReminderBlock,
 } from './reading.ts'
 import { parseCron } from './cron.ts'
 import {
-  DEFAULT_COUNTER_SCOPE,
+  applySessionEvent,
+  counterChange,
   initialState,
-  stateFromEventData,
-  timeReminderStateSchema,
-  withCounter,
-  withoutCounter,
-} from './state.ts'
-import { PLUGIN_NAME, STATE_EVENT_TYPE } from './state.ts'
-import type { CounterRecord, CounterScope, TimeMode, TimeReminderState } from './types.ts'
-import { visibleCounters, type SessionFacts } from './visibility.ts'
+  timeModeChange,
+  PLUGIN_NAME,
+  PUSH_FORM,
+  TIME_COUNTER_TOOL,
+  TIME_MODE_TOOL,
+} from './fold.ts'
+import type { CounterChange } from './fold.ts'
+import { timeReminderStateSchema } from './state.ts'
+import type { TimeMode, TimeReminderState } from './types.ts'
+import { pushTargets, visibleCounters, type SessionFacts } from './visibility.ts'
 
 /** Default schedule: once a day at 00:00 in the display zone. */
 const DEFAULT_CRON = '0 0 * * *'
-
-declare module '@deepseek-ai/dsh-session' {
-  interface SessionEventMap {
-    /** One committed revision of this plugin's per-Session state. */
-    'time-reminder/state': {
-      readonly mode: TimeMode
-      readonly counters: readonly CounterRecord[]
-      readonly lastInjectionAt: number | null
-      readonly lastTurnInjectionAt: number | null
-      readonly lastMessageAt: number | null
-    }
-  }
-}
 
 declare module '@deepseek-ai/dsh-session-projection' {
   interface SessionProjectionStateMap {
@@ -77,6 +69,12 @@ export interface Config {
    * `0` reads on every step, which is the point of the mode.
    */
   fineIntervalMs?: number
+  /**
+   * How a counter notice reaches the related Sessions that can see the counter:
+   * `inject` queues it for their next step without waking them (default),
+   * `steer` also wakes an idle Session into a new turn, and `off` sends none.
+   */
+  counterNotice?: 'inject' | 'steer' | 'off'
 }
 
 /** Plugin configuration schema. */
@@ -85,23 +83,21 @@ export const Config: z<Config> = z.object({
   cron: z.string().default(DEFAULT_CRON),
   defaultMode: z.union(['off', 'cron', 'turn', 'fine'] as const).default('cron'),
   fineIntervalMs: z.number().step(1).min(0).default(0),
+  counterNotice: z.union(['inject', 'steer', 'off'] as const).default('inject'),
 })
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = PLUGIN_NAME
 
 /** Services this plugin reads. */
-export const inject = ['sessions', 'sessionProjections', 'tools']
+export const inject = ['sessions', 'sessionProjections', 'tools', 'agents']
 
-/** Tool name controlling the time mode. */
-export const TIME_MODE_TOOL = 'time_mode'
-/** Tool name managing counters. */
-export const TIME_COUNTER_TOOL = 'time_counter'
+/** Tool names; the fold reads the same names back out of the log. */
+export { TIME_COUNTER_TOOL, TIME_MODE_TOOL }
 
 /** The Session surface this plugin uses. */
 export interface SessionHandle {
   readonly header: { readonly id: string; readonly parentSession?: string }
-  append(type: never, data: never): unknown
 }
 
 /** A message whose source may carry the browser zone. */
@@ -124,6 +120,7 @@ export function apply(ctx: Context, config: Config): void {
   if (!Number.isSafeInteger(fineIntervalMs) || fineIntervalMs < 0) {
     throw new TypeError(`time-reminder: fineIntervalMs must be a non-negative safe integer, got ${String(fineIntervalMs)}`)
   }
+  const counterNoticeMode = config.counterNotice ?? 'inject'
   /** Parse one Session's schedule, refusing a corrupt stored expression loudly. */
   const expressionOf = (state: TimeReminderState): CronExpression => {
     if (state.cron === configuredCron) return defaultExpression
@@ -136,22 +133,18 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.sessionProjections.register({
     key: 'time-reminder',
-    stateVersion: 1,
+    // Bumped from 1 when the state stopped being committed as a plugin-owned
+    // event and became a fold of the log: `pending` was added, and the
+    // projection cache keys its rows by this version — a cached row written at
+    // version 1 lacks the field, so it must not be adopted.
+    stateVersion: 2,
     stateSchema: timeReminderStateSchema,
     init: () => initialState(defaultMode, configuredCron),
-    apply: (state, event) => {
-      const committed = stateFromEventData(event.type, event.data, configuredCron)
-      if (committed !== undefined) return committed
-      if (event.type === 'turn/start' || event.type === 'turn/end') {
-        return state.lastTurnInjectionAt === null ? state : { ...state, lastTurnInjectionAt: null }
-      }
-      if (event.type === 'assistant/message' || event.type === 'tool/result') {
-        // Step 1's baseline is the newest model-visible message, which is what "time
-        // since the previous turn stopped" means in practice.
-        return state.lastMessageAt === event.time ? state : { ...state, lastMessageAt: event.time }
-      }
-      return state
-    },
+    // The whole state is a fold of events this plugin already produces: its own
+    // tool calls (committed once their result reports success) and its own
+    // injected readings. No plugin-owned event type, so no unknown type can
+    // reach the log and make the Session unreadable on reload.
+    apply: (state, event) => applySessionEvent(state, event),
   })
 
   /** Read one Session's committed state. */
@@ -159,18 +152,6 @@ export function apply(ctx: Context, config: Config): void {
     const session = ctx.sessions.get(sessionId as never)
     if (session === undefined) return initialState(defaultMode, configuredCron)
     return ctx.sessionProjections.stateOf(session, 'time-reminder') ?? initialState(defaultMode, configuredCron)
-  }
-
-  /** Commit a state revision; the projection folds it back in. */
-  const commit = (session: SessionHandle, state: TimeReminderState): void => {
-    session.append(STATE_EVENT_TYPE as never, {
-      mode: state.mode,
-      cron: state.cron,
-      counters: state.counters,
-      lastInjectionAt: state.lastInjectionAt,
-      lastTurnInjectionAt: state.lastTurnInjectionAt,
-      lastMessageAt: state.lastMessageAt,
-    } as never)
   }
 
   const scratch: SessionFacts[] = []
@@ -192,6 +173,40 @@ export function apply(ctx: Context, config: Config): void {
   const displayZone = (messages: readonly MessageLike[]): string => {
     const zones = requestTimeZones(messages)
     return zones.length === 1 ? zones[0]! : fallbackTimeZone
+  }
+
+  /**
+   * Tell the Sessions a changed counter reaches — and, when the change can move
+   * that set, the Sessions it just left.
+   *
+   * Delivery is the host's inbox seam: `inject` queues for the target's next step
+   * without waking it, `steer` also wakes an idle target into a new turn. A target
+   * whose Session is not resident is skipped; its state is still folded from the
+   * log when it returns, so the counter reappears in its readings then.
+   */
+  const announceCounter = (owner: SessionHandle, announced: CounterChange['announced']): void => {
+    if (announced === undefined || counterNoticeMode === 'off') return
+    const facts: SessionFacts = { id: owner.header.id, parentSession: owner.header.parentSession }
+    const text = systemReminderBlock(counterNoticeText(announced.kind, announced.counter, owner.header.id, displayZone([])))
+    const targets = new Map<string, 'ancestor' | 'descendant'>()
+    for (const target of pushTargets(facts, announced.counter, lineageSource)) targets.set(target.id, target.direction)
+    if (announced.previous !== undefined) {
+      for (const target of pushTargets(facts, announced.previous, lineageSource)) {
+        if (!targets.has(target.id)) targets.set(target.id, target.direction)
+      }
+    }
+    for (const id of targets.keys()) {
+      const agent = ctx.agents.get(id as never)
+      if (agent === undefined) continue
+      const message = createUserMessage({
+        content: [{ type: 'text', text }],
+        // `relay` keeps the fold from reading this notice as a time reading; the
+        // sender id is the durable record of who made the change.
+        source: { kind: PLUGIN_NAME, form: PUSH_FORM, senderSessionId: owner.header.id },
+      })
+      if (counterNoticeMode === 'steer') agent.steer(message)
+      else agent.inject(message)
+    }
   }
 
   // ── the reading ────────────────────────────────────────────────────────────
@@ -233,29 +248,36 @@ export function apply(ctx: Context, config: Config): void {
       zone,
       cron: expression,
       fresh: step === 1,
-      // `turn` reads only at step 1 and always reports the gap to the previous turn;
-      // `cron`/`fine` distinguish the first step from later ones.
+      // `turn` reads only at step 1 and always reports the gap to the previous turn.
+      // `cron`/`fine` distinguish the first step from later ones; a later step with no
+      // reading in this turn (`cron` firing mid-turn) falls back to the message
+      // baseline rather than reporting nothing.
       ...state.mode === 'turn'
         ? state.lastMessageAt === null ? {} : { sinceLastMessageMs: now - state.lastMessageAt }
-        : step === 1
+        : step === 1 || state.lastTurnInjectionAt === null
           ? state.lastMessageAt === null ? {} : { sinceMessageMs: now - state.lastMessageAt }
-          : state.lastTurnInjectionAt === null ? {} : { sinceReadingMs: now - state.lastTurnInjectionAt },
+          : { sinceReadingMs: now - state.lastTurnInjectionAt },
       ...state.lastInjectionAt === null ? {} : { lastInjectionAt: state.lastInjectionAt },
       counters,
     })
 
-    // The record of this injection is durable state, not process memory: `cron`
-    // due-ness and the step deltas must survive a Session restore.
-    commit(session, { ...state, lastInjectionAt: now, lastTurnInjectionAt: now })
-
+    // The reading is its own durable record: the loop logs this message as a
+    // `user/message` carrying `source.kind`, and the fold dates the next
+    // `lastInjectionAt` from that event. Nothing else needs to be written.
+    //
+    // The framing and the `notice` form are presentation contracts: the body
+    // reaches the model as system context instead of user speech, and the
+    // collapsed context row shows the summary without expanding. A `snapshot`
+    // form records no summary, which left the row showing only the producer
+    // name — the reading was there but unreadable at a glance.
     return {
       ...decision,
       messages: [...decision.messages, createUserMessage({
-        content: [{ type: 'text', text }],
+        content: [{ type: 'text', text: systemReminderBlock(text) }],
         source: {
           kind: PLUGIN_NAME,
-          form: 'snapshot',
-          sections: [{ name: PLUGIN_NAME, text }],
+          form: 'notice',
+          summary: readingSummary(state.mode, now, zone),
         },
       })],
     }
@@ -296,21 +318,18 @@ export function apply(ctx: Context, config: Config): void {
     },
     execute(args, exec) {
       const session = requireSession(exec)
-      const state = stateOf(session.header.id)
-      const mode = args.mode as TimeMode
-      if (mode !== 'off' && mode !== 'cron' && mode !== 'turn' && mode !== 'fine') {
-        throw new TypeError(`invalid time mode ${JSON.stringify(args.mode)}; expected off, cron, turn, or fine`)
-      }
-      const requested = typeof args.cron === 'string' && args.cron.length > 0 ? args.cron : undefined
-      const activeText = requested ?? state.cron
-      const active = requested === undefined ? expressionOf(state) : parseCron(requested)
+      const now = Date.now()
+      // The same pure change the log fold applies, so a restored Session lands on
+      // exactly the state this call committed.
+      const next = timeModeChange(stateOf(session.header.id), args)
+      const mode = next.mode
       const zone = displayZone([])
-      commit(session, { ...state, mode, cron: activeText })
+      const active = expressionOf(next)
       return {
         mode,
         schedule: describeSchedule(active, zone),
         timeZone: zone,
-        now: formatTimestamp(Date.now(), zone),
+        now: formatTimestamp(now, zone),
         note: mode === 'off'
           ? 'Automatic readings are off. Call this tool whenever you need the current time.'
           : mode === 'cron'
@@ -354,7 +373,7 @@ export function apply(ctx: Context, config: Config): void {
       },
       depth: {
         type: 'integer',
-        description: 'How many lineage levels the exposure reaches (scope). Defaults to 1.',
+        description: 'How many lineage generations the exposure reaches (scope). Defaults to 2.',
       },
     },
     output: {
@@ -397,67 +416,14 @@ export function apply(ctx: Context, config: Config): void {
     },
     execute(args, exec) {
       const session = requireSession(exec)
-      const state = stateOf(session.header.id)
       const now = Date.now()
       const zone = displayZone([])
-      const action = String(args.action)
-      const counterName = typeof args.name === 'string' && args.name.length > 0 ? args.name : undefined
-      let counters = state.counters
-      let note = ''
-
-      if (action !== 'list' && counterName === undefined) {
-        throw new TypeError(`${TIME_COUNTER_TOOL}: action "${action}" requires a counter name`)
-      }
-      const existing = counterName === undefined ? undefined : state.counters.find((counter) => counter.name === counterName)
-
-      switch (action) {
-        case 'start':
-          counters = withCounter(state, {
-            name: counterName!,
-            startedAt: now,
-            ...typeof args.note === 'string' ? { note: args.note } : {},
-            inject: args.inject === true,
-            scope: scopeFromArgs(args, existing?.scope ?? DEFAULT_COUNTER_SCOPE),
-          })
-          note = existing === undefined ? `Started counter "${counterName}".` : `Restarted counter "${counterName}".`
-          break
-        case 'reset':
-          if (existing === undefined) throw new TypeError(`counter "${counterName}" does not exist`)
-          counters = withCounter(state, { ...existing, startedAt: now })
-          note = `Reset counter "${counterName}".`
-          break
-        case 'lapse':
-        case 'list':
-          note = action === 'lapse' && existing === undefined
-            ? `Counter "${counterName}" does not exist.`
-            : 'Elapsed times are measured from each counter\'s baseline.'
-          break
-        case 'note':
-          if (existing === undefined) throw new TypeError(`counter "${counterName}" does not exist`)
-          counters = withCounter(state, { ...existing, note: String(args.note ?? '') })
-          note = `Relabelled counter "${counterName}".`
-          break
-        case 'scope':
-          if (existing === undefined) throw new TypeError(`counter "${counterName}" does not exist`)
-          counters = withCounter(state, {
-            ...existing,
-            inject: args.inject === undefined ? existing.inject : args.inject === true,
-            scope: scopeFromArgs(args, existing.scope),
-          })
-          note = `Updated visibility for counter "${counterName}".`
-          break
-        case 'remove':
-          if (existing === undefined) throw new TypeError(`counter "${counterName}" does not exist`)
-          counters = withoutCounter(state, counterName!)
-          note = `Removed counter "${counterName}".`
-          break
-        default:
-          assertNever(action as never, 'time counter action')
-      }
-
-      commit(session, { ...state, counters })
+      // The same pure change the log fold applies, so a restored Session lands on
+      // exactly the state this call committed.
+      const change = counterChange(stateOf(session.header.id), args, now)
+      announceCounter(session, change.announced)
       const facts: SessionFacts = { id: session.header.id, parentSession: session.header.parentSession }
-      const visible = visibleCounters(facts, { ...state, counters }, lineageSource, stateOfId)
+      const visible = visibleCounters(facts, change.state, lineageSource, stateOfId)
       return {
         now: formatTimestamp(now, zone),
         counters: visible.map((resolved) => ({
@@ -471,7 +437,7 @@ export function apply(ctx: Context, config: Config): void {
           depth: resolved.counter.scope.depth,
           origin: resolved.origin,
         })),
-        note,
+        note: change.note,
       }
     },
   }))
@@ -507,17 +473,4 @@ export function requestTimeZones(messages: readonly MessageLike[]): string[] {
     zones.add(candidate.clientTimeZone)
   }
   return [...zones].sort()
-}
-
-/** Merge scope arguments over the previous scope, validating the depth. */
-function scopeFromArgs(args: Record<string, unknown>, previous: CounterScope): CounterScope {
-  const depth = args.depth === undefined ? previous.depth : args.depth
-  if (!Number.isSafeInteger(depth) || (depth as number) < 0) {
-    throw new TypeError(`time-reminder: depth must be a non-negative safe integer, got ${String(args.depth)}`)
-  }
-  return {
-    toChildren: args.toChildren === undefined ? previous.toChildren : args.toChildren === true,
-    toParents: args.toParents === undefined ? previous.toParents : args.toParents === true,
-    depth: depth as number,
-  }
 }

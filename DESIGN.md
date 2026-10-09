@@ -48,42 +48,86 @@ counters:
 父子可见性沿 `session.header.parentSession` 上溯、`ctx.sessions.list()` 下探，`depth` 限代数。
 同名时**近者胜**（自己的计数器永远遮蔽继承来的）。
 
+⚠️ **这两个开关的方向曾经装反**（2026-10-09 实机挖出，已修）：实现里"子看父"错误地读祖先的
+`toParents`、"父看子"错误地读后代的 `toChildren`，于是默认姿势变成**向上暴露、向下隐藏**，与本
+文件的"只向下暴露两代"正好相反。单元测试当时是照实现写的，33 条全绿也没拦住它——只有实机能判别
+（`toChildren=true, toParents=false` 的计数器子代理看不到、`toChildren=false, toParents=true` 的
+父看不到，而两个都开就都能看到）。修法是两处条件互换；用例语义跟着翻，并新增 `pushTargets` 用例。
+
+## 计数器变动的推送
+
+**任何会改动计数器的动作**（`start`/重启、`reset`、`note`、`scope`、`remove`）都要让"看得见它"的
+会话立刻知道，而不是等它们下一次读数。只读动作（`lapse`/`list`）不推。
+
+- **收件人 = 变更前后可见集合的并集**：`scope` 收窄或 `remove` 时，原来看得见的会话也要收到"它走了"
+  （`pushTargets` 对新旧两份计数器各算一次，按会话 id 去重）。
+- **投递走宿主的 inbox 缝**：`ctx.agents.get(id)` 拿到对方 Agent，再
+  `inject(message)`（投到下一个 pre-step、**不唤醒**，默认）或 `steer(message)`（投到最近一步并唤醒
+  idle 的对方）。配置项 `counterNotice: inject | steer | off`，默认 `inject`——不会把已经收工的
+  子代理重新吵醒。对方不在驻留中时投不进去，跳过即可（它的状态本来就从日志折叠）。
+- **来源必须是 `form: 'relay'` + `senderSessionId`**：折叠只把 `form: 'notice'` 的消息当读数，
+  否则这条通知会被当成"我刚读过时间"，把收件人的 cron 判定与 turn 节奏带偏。
+- 通知正文由 `counterNoticeText` 生成（纯函数、可单测），套 `<system-reminder>` 框后投递。
+
 ## 状态如何落盘
 
-每会话状态（模式 + 计数器）**不能只存在投影里**：投影从事件重放必须能推出同样的状态。
-所以每次状态变更都追加一条自定义会话事件：
+每会话状态（模式 + 计划 + 计数器 + 读数历史）**不写自己的事件类型**：DSH 0.2.0 的公开
+API 无法给事件打 `ignorable` 标记（`Session.append()` 只接受 `surfaceOp` / `sourceEventSeqs`），
+而读路径规定"事件类型不在词表内、且没有该标记 ⇒ 拒绝解释整个日志"。插件只要写一条，
+那个会话**重启后就打不开**（2026-10-09 实测：1 条 `time-reminder/state` 锁死 5341 条事件的会话）。
 
-```
-time-reminder/state   data: { mode, counters }
-```
+所以状态改为**折叠日志里已有的事件**（`src/fold.ts`，纯函数、可单测）：
 
-投影 `time-reminder` 消费该事件重建状态（`init` 用配置默认值）。这样：
+| 状态字段 | 来源事件 | 规则 |
+|---|---|---|
+| `mode` / `cron` | `tool/call` name=`time_mode` | 等配对的 `tool/result` 报告成功才采纳；参数非法则不采纳（工具当时也报错） |
+| `counters` | `tool/call` name=`time_counter` | 同上；新基准 = 该 `tool/call` 的 `time` |
+| `lastInjectionAt` / `lastTurnInjectionAt` | `user/message`（`source.kind = dsh-time-reminder`） | 就是插件自己注入的那条读数 |
+| `lastMessageAt` | `assistant/message` / `tool/result` | 步 1 的间隔基准 |
+| `pending`（在途调用） | `tool/call` → `tool/result` | `callId` 配对；失败即丢弃；`turn/start`/`turn/end` 清空 |
 
-- 会话日志自足 ⇒ 可重放、可审计；
-- 恢复会话后模式与计时器仍在；
-- 注入的消息走 `createUserMessage` + 快照来源，满足"模型可见 ⟺ 已落盘"。
+于是：
+
+- 会话日志自足 ⇒ 可重放、可审计（同一个日志折两遍得到同一个状态）；
+- 恢复会话后模式与计时器仍在，且与工具当场产生的状态**由同一个纯函数**得出
+  （`timeModeChange` / `counterChange` 同时被工具与折叠调用），不会出现两份实现漂移；
+- 注入的消息走 `createUserMessage` + 快照来源，满足"模型可见 ⟺ 已落盘"；
+- 日志里**不再出现任何插件自有的事件类型**，装载路径与读路径都不再有兼容风险。
+
+代价（写进"已知限制"）：状态只能从"落进日志的东西"恢复；新计数器基准取调用被记录的
+时刻，与进程内 `Date.now()` 可能差几毫秒（显示精度到秒）。
 
 ## 注入读数形状
 
-每个合格步骤追加一条 user 角色消息（连同请求末尾，**不破坏 KV 前缀**）：
+每个合格步骤追加一条 **user 角色**消息（追加在请求末尾，**不破坏 KV 前缀**）——`agent/pre-step` 的
+决策类型只收 `UserMessage[]`，所以"真正的 system/developer 消息"在这条钩子上不可用；塞进系统提示词又会
+每步打掉整段 KV 缓存。正文因此**框成 `<system-reminder>` 块**（与 AGENTS.md 同一套框法），
+让模型按"系统上下文"读：
 
 ```
+<system-reminder>
 Time sampled while preparing turn 12, step 3: 2026-10-09T01:23:45+08:00[Asia/Shanghai]
 Time mode: cron (daily 00:00 Asia/Shanghai; last 2026-10-08T00:00:03+08:00)
 Elapsed since the preceding model-visible message: 187s
 [counters] deploy=1243s (开始部署)
+</system-reminder>
 ```
 
-最后一行只在**有计数器要求注入**时出现。
+最后一行只在**有计数器要求注入**时出现。正文里出现的 `</system-reminder>` 会被转义成 `<\/system-reminder>`
+（计数器备注是自由文本），防止提前闭合——与 workspace 指令注入同一条规则。
+
+**GUI 可见性**走来源声明：`source = { kind: 'dsh-time-reminder', form: 'notice', summary: '<mode> reading · <时刻>' }`。
+客户端按 `form` 选渲染器：`notice` 会把摘要放到**折叠行**上（"不展开就能读到"），展开是完整正文；
+`snapshot`（官方 time-context 用的那个）不记录摘要，折叠行只剩生产者名，读数等于看不见。
 
 ## 工具
 
 | 工具 | 参数 | 作用 |
 |---|---|---|
-| `time_mode` | `mode: off \| cron \| turn \| fine`，可选 `cron`（cron 表达式） | 切换精度；写一条状态事件 |
-| `time_counter` | `action: list \| start \| lapse \| note \| reset \| set` | 建/查/改计时器；属性（注入、跨会话、父子可见、层数）在调用时设置 |
+| `time_mode` | `mode: off \| cron \| turn \| fine`，可选 `cron`（cron 表达式） | 切换精度；改动由这次调用的调用/结果在日志里留痕 |
+| `time_counter` | `action: start \| lapse \| list \| note \| scope \| reset \| remove` | 建/查/改计时器；属性（注入、跨会话、父子可见、层数）在调用时设置 |
 
-`lapse` 返回该计数器自基准以来的时长；`set` 改属性。
+`lapse` 返回该计数器自基准以来的时长；`scope` 改可见性与是否注入。
 
 ## 与官方并存
 
@@ -100,15 +144,17 @@ web profile 里：
 
 禁用官方是**必须**的：两处都在 `agent/pre-step` 追加读数，都开就是每步两条。
 
-## 复用而非手搓
+## 时区与 cron
 
-cron 解析用 `@deepseek-ai/dsh-schedule` 的 `parseCronInput` / `canonicalizeCronExpression` /
-`resolveCronOccurrence` / `resolveDailyOccurrence`——DSH 自己已测试过，不重写。
-时区统一走 `Intl.DateTimeFormat` 的 `resolvedOptions().timeZone` 规范化。
+时区统一走 `Intl.DateTimeFormat` 的 `resolvedOptions().timeZone` 规范化（`reading.ts`）。
+cron 解析**没有**复用 `@deepseek-ai/dsh-schedule`：那是私有工作区包，插件在 profile 里解析不到，
+所以 `src/cron.ts` 自带一个最小实现（`*`、字面量、`a-b`、`a-b/n`、列表、`@daily` 等宏）。
 
 ## 已知限制
 
 - **`refreshIntervalMs` 式的节流在 `fine` 下不存在**：每步一条读数，会累积到压缩遮蔽为止（token 成本）。
 - **跨会话计数器不进日志**：历史回放时它的取值无法重建（只有会话内计数器可重建）。
+- **状态只能从落进日志的东西恢复**：失败的 `time_mode` / `time_counter` 调用不改变状态；
+  新计数器的基准取 `tool/call` 被记录的时刻，与进程内 `Date.now()` 可能差几毫秒（显示到秒，看不出）。
 - **cron 判定用挂钟**：系统时间回拨可能导致同一触发点重复注入或漏注入；判定记录的是"上次注入时刻"。
 - 桌面端 profile 尚未挂载。

@@ -1,5 +1,6 @@
 /**
- * Pure rendering of one model-facing time reading.
+ * Pure rendering of this plugin's model-facing text: one time reading, and the
+ * counter notices delivered to related Sessions.
  *
  * Kept free of cordis and session types so it can be tested directly: the caller
  * supplies the instant, the resolved display zone, the mode decision, and the
@@ -9,9 +10,15 @@
  */
 
 import { latestOccurrence, type CronExpression } from './cron.ts'
+import type { CounterNoticeKind, CounterRecord, TimeMode } from './types.ts'
 
-/** Time mode controlling automatic injection; each Session owns its own value. */
-export type TimeMode = 'off' | 'cron' | 'fine'
+export type { TimeMode } from './types.ts'
+
+/** Opening tag of the framing the model reads as system context rather than user speech. */
+const SYSTEM_REMINDER_OPEN = '<system-reminder>'
+
+/** Closing tag of that framing. */
+const SYSTEM_REMINDER_CLOSE = '</system-reminder>'
 
 /** One counter scheduled to appear in the reading. */
 export interface CounterLine {
@@ -154,4 +161,70 @@ export function renderReading(input: ReadingInput): string {
       `${counter.name}=${formatDuration(counter.elapsedMs)}${counter.note === undefined ? '' : ` (${counter.note})`}`).join('  ')}`)
   }
   return lines.join('\n')
+}
+
+/**
+ * Frame a reading as a system-reminder block.
+ *
+ * The model then reads it as system context rather than as something the user
+ * said. The framing mirrors the workspace-instruction injection, including its
+ * escaping rule: a body that could close the frame early (a counter note is
+ * free-form user text) has that tag escaped instead.
+ *
+ * @param text - the rendered reading body.
+ * @returns the framed model-facing message text.
+ */
+export function systemReminderBlock(text: string): string {
+  return `${SYSTEM_REMINDER_OPEN}\n${text.replaceAll(SYSTEM_REMINDER_CLOSE, '<\\/system-reminder>')}\n${SYSTEM_REMINDER_CLOSE}`
+}
+
+/**
+ * One-line account of a reading for the collapsed context row.
+ *
+ * The row shows this without expanding, so it has to name the fact that matters
+ * at a glance: what kind of reading arrived, and when.
+ *
+ * @param mode - mode that produced the reading.
+ * @param at - the sampled instant.
+ * @param timeZone - resolved display zone.
+ * @returns the collapsed-row summary.
+ */
+export function readingSummary(mode: TimeMode, at: number, timeZone: string): string {
+  return `${mode} reading · ${formatTimestamp(at, timeZone)}`
+}
+
+/**
+ * Model-facing notice that a counter changed in a related Session.
+ *
+ * It is delivered to the Sessions a counter reaches or just left, so it states
+ * what those Sessions cannot see for themselves: who owns the counter, whether it
+ * joins their readings, and how far its scope reaches.
+ *
+ * @param kind - what the owning Session did to the counter.
+ * @param counter - the counter as committed by that call.
+ * @param ownerSessionId - the Session that made the change.
+ * @param timeZone - the owner's resolved display zone.
+ * @returns the notice body, without the `<system-reminder>` framing.
+ */
+export function counterNoticeText(kind: CounterNoticeKind, counter: CounterRecord, ownerSessionId: string, timeZone: string): string {
+  const note = counter.note === undefined ? '' : ` (${counter.note})`
+  const scope = `children=${counter.scope.toChildren}; parents=${counter.scope.toParents}; depth=${counter.scope.depth}`
+  const reading = counter.inject ? 'it joins your readings' : 'it stays out of your readings'
+  switch (kind) {
+    case 'created':
+      return `[counters] "${counter.name}"${note} was created by session ${ownerSessionId} at ${formatTimestamp(counter.startedAt, timeZone)}; `
+        + `${reading} while it stays visible (${scope}).`
+    case 'restarted':
+      return `[counters] "${counter.name}"${note} was restarted by session ${ownerSessionId}; its baseline is now `
+        + `${formatTimestamp(counter.startedAt, timeZone)} (${scope}).`
+    case 'reset':
+      return `[counters] "${counter.name}"${note} was reset by session ${ownerSessionId}; its baseline is now `
+        + `${formatTimestamp(counter.startedAt, timeZone)}.`
+    case 'relabelled':
+      return `[counters] "${counter.name}" was relabelled by session ${ownerSessionId} to ${JSON.stringify(counter.note ?? '')}.`
+    case 'visibility':
+      return `[counters] "${counter.name}"${note} changed visibility (${scope}); ${reading}.`
+    case 'removed':
+      return `[counters] "${counter.name}"${note} was removed by session ${ownerSessionId}; it leaves your readings too.`
+  }
 }

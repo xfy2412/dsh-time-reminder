@@ -1,16 +1,22 @@
 /**
- * Lineage-based counter visibility.
+ * Lineage-based counter visibility, and the push targets derived from it.
  *
  * The three-generation fixture is `root → middle → leaf`, plus an unrelated
  * `other`. `read(sessionId)` always supplies that Session's own state, so a test
  * can never disagree with itself about what a Session holds.
+ *
+ * The scope flags are named from the owning Session's point of view:
+ * `toChildren` exposes a counter to Sessions delegated from the owner,
+ * `toParents` exposes it to the owner's ancestors. The default scope
+ * (`toChildren: true`, `toParents: false`) therefore reaches two generations
+ * downward and never upward.
  *
  * @module dsh-time-reminder/tests/visibility.test
  */
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { visibleCounters, type SessionFacts } from '../src/visibility.ts'
+import { pushTargets, visibleCounters, type SessionFacts } from '../src/visibility.ts'
 import { DEFAULT_COUNTER_SCOPE, type CounterRecord, type TimeReminderState } from '../src/types.ts'
 
 /** Build one counter with scope overrides. */
@@ -24,10 +30,12 @@ const counter = (name: string, startedAt = 1_000, scope: Partial<CounterRecord['
 /** Build a state carrying the given counters. */
 const state = (...counters: CounterRecord[]): TimeReminderState => ({
   mode: 'cron',
+  cron: '0 0 * * *',
   lastInjectionAt: null,
   lastTurnInjectionAt: null,
   lastMessageAt: null,
   counters,
+  pending: [],
 })
 
 const ROOT: SessionFacts = { id: 'root', parentSession: undefined }
@@ -48,6 +56,9 @@ function fixture(states: Record<string, TimeReminderState>) {
     /** Full resolved entries, when a test needs more than the triple. */
     resolvedFor: (session: SessionFacts) =>
       visibleCounters(session, states[session.id] ?? state(), source, stateOf),
+    /** Sessions one counter reaches, as `[id, direction, distance]` triples. */
+    targetsFor: (owner: SessionFacts, counter_: CounterRecord): [string, string, number][] =>
+      pushTargets(owner, counter_, source).map((target) => [target.id, target.direction, target.distance]),
   }
 }
 
@@ -56,86 +67,70 @@ test('a session always sees its own counters', () => {
   assert.deepEqual(seenBy(ROOT), [['own', 'own', 0]])
 })
 
-test('toParents is off by default, so an ancestor stays invisible', () => {
-  const { seenBy } = fixture({ root: state(counter('hidden')), middle: state() })
-  assert.deepEqual(seenBy(MIDDLE), [], 'the child does not see the parent counter')
-})
-
-test('toParents exposes a counter to descendants within depth', () => {
-  const { seenBy } = fixture({
-    root: state(counter('shared', 1_000, { toParents: true, depth: 2 })),
-    middle: state(),
-    leaf: state(),
-  })
+test('the default scope reaches two generations downward', () => {
+  const { seenBy } = fixture({ root: state(counter('shared')), middle: state(), leaf: state() })
   assert.deepEqual(seenBy(MIDDLE), [['shared', 'ancestor', 1]])
-  assert.deepEqual(seenBy(LEAF), [['shared', 'ancestor', 2]])
+  assert.deepEqual(seenBy(LEAF), [['shared', 'ancestor', 2]], 'depth 2 spans the grandchild too')
 })
 
-test('depth stops the walk one level short', () => {
+test('the default scope never reaches upward', () => {
+  const { seenBy } = fixture({ root: state(), middle: state(counter('fromChild')), leaf: state() })
+  assert.deepEqual(seenBy(ROOT), [], 'toParents defaults to false, so an ancestor stays blind')
+  assert.deepEqual(seenBy(MIDDLE), [['fromChild', 'own', 0]])
+})
+
+test('toChildren false hides a counter from the whole subtree', () => {
   const { seenBy } = fixture({
-    root: state(counter('oneLevel', 1_000, { toParents: true, depth: 1 })),
+    root: state(counter('private', 1_000, { toChildren: false })),
     middle: state(),
     leaf: state(),
   })
-  assert.equal(seenBy(MIDDLE).length, 1)
+  assert.deepEqual(seenBy(MIDDLE), [])
+  assert.deepEqual(seenBy(LEAF), [])
+})
+
+test('depth stops the downward walk one level short', () => {
+  const { seenBy } = fixture({
+    root: state(counter('oneLevel', 1_000, { depth: 1 })),
+    middle: state(),
+    leaf: state(),
+  })
+  assert.deepEqual(seenBy(MIDDLE), [['oneLevel', 'ancestor', 1]])
   assert.deepEqual(seenBy(LEAF), [], 'two levels away exceeds depth 1')
 })
 
-test('toChildren exposes a counter downward, and never to an unrelated session', () => {
-  const { seenBy, resolvedFor } = fixture({
-    root: state(counter('down', 1_000, { toChildren: true, depth: 2 })),
-    middle: state(),
-    leaf: state(),
-    other: state(),
-  })
-  // ROOT owns `down`, so for ROOT itself it is `own`; the downward exposure is what
-  // makes it show up in MIDDLE and LEAF at all.
-  assert.deepEqual(seenBy(ROOT), [['down', 'own', 0]])
-  assert.deepEqual(seenBy(MIDDLE), [], 'a child does not see a parent counter without toParents')
-  assert.deepEqual(seenBy(OTHER), [], 'an unrelated session sees nothing')
-  // Reading from ROOT while the counter lives elsewhere is the case toChildren serves.
-  const fromRoot = resolvedFor(ROOT)
-  assert.equal(fromRoot.length, 1)
-  assert.equal(fromRoot[0]!.origin, 'own', 'the owner keeps its own entry, not a descendant duplicate')
-})
-
-test('toChildren is on by default', () => {
-  const { seenBy } = fixture({
-    root: state(counter('down', 1_000, { toChildren: true, depth: 2 })),
-    middle: state(),
-    leaf: state(),
-  })
-  // `down` lives on ROOT; a default-scoped counter on ROOT must not reach up.
-  assert.deepEqual(seenBy(LEAF), [], 'default scope never exposes upward')
-  const defaulted = fixture({ middle: state(counter('fromMiddle')), leaf: state() })
-  assert.deepEqual(defaulted.seenBy(LEAF), [], 'leaf does not see a parent counter by default')
-})
-
-test('a descendant counter is visible from its ancestor when it opts in', () => {
-  // The holder is the descendant, the reader is the ancestor: this is the direction
-  // `toChildren` names, and the only shape that can report `origin: descendant`.
+test('toParents exposes a descendant counter to its ancestors within depth', () => {
   const { seenBy } = fixture({
     root: state(),
     middle: state(),
-    leaf: state(counter('fromLeaf', 1_000, { toChildren: true, depth: 2 })),
+    leaf: state(counter('up', 1_000, { toParents: true, depth: 2 })),
   })
-  assert.deepEqual(seenBy(MIDDLE), [['fromLeaf', 'descendant', 1]])
-  assert.deepEqual(seenBy(ROOT), [['fromLeaf', 'descendant', 2]])
+  assert.deepEqual(seenBy(MIDDLE), [['up', 'descendant', 1]])
+  assert.deepEqual(seenBy(ROOT), [['up', 'descendant', 2]])
+})
+
+test('an unrelated session sees nothing from the lineage', () => {
+  const { seenBy } = fixture({
+    root: state(counter('shared')),
+    middle: state(),
+    leaf: state(counter('leafOnly', 1_000, { toParents: true, depth: 2 })),
+    other: state(),
+  })
+  assert.deepEqual(seenBy(OTHER), [])
 })
 
 test('a session-local counter is never reported as inherited', () => {
   const { seenBy } = fixture({
-    root: state(counter('rootOnly', 1_000, { toParents: true, depth: 2 })),
-    middle: state(counter('rootOnly', 5_000, { toChildren: true, depth: 2 })),
+    root: state(counter('sameName', 1_000, { depth: 2 })),
+    middle: state(counter('sameName', 5_000, { depth: 2 })),
     leaf: state(),
   })
-  // MIDDLE holds its own `rootOnly`, so ROOT's same-named counter never surfaces here.
-  assert.deepEqual(seenBy(MIDDLE), [['rootOnly', 'own', 0]])
+  assert.deepEqual(seenBy(MIDDLE), [['sameName', 'own', 0]])
 })
 
-test('a own counter shadows an inherited one with the same name', () => {
+test('an own counter shadows an inherited one with the same name', () => {
   const { resolvedFor } = fixture({
-    root: state(counter('deploy', 1_000, { toParents: true, depth: 2 })),
+    root: state(counter('deploy', 1_000, { depth: 2 })),
     middle: state(),
     leaf: state(counter('deploy', 9_999)),
   })
@@ -147,8 +142,8 @@ test('a own counter shadows an inherited one with the same name', () => {
 
 test('nearest relation wins among inherited counters with the same name', () => {
   const { resolvedFor } = fixture({
-    root: state(counter('shared', 1, { toParents: true, depth: 2 })),
-    middle: state(counter('shared', 2, { toParents: true, depth: 1 })),
+    root: state(counter('shared', 1, { depth: 2 })),
+    middle: state(counter('shared', 2, { toParents: true, depth: 2 })),
     leaf: state(),
   })
   const visible = resolvedFor(LEAF)
@@ -165,9 +160,38 @@ test('an unknown ancestor id stops the walk without throwing', () => {
 
 test('results are ordered nearest first, then by name', () => {
   const { seenBy } = fixture({
-    root: state(counter('zulu', 1_000, { toParents: true, depth: 2 }), counter('alpha', 1_000, { toParents: true, depth: 2 })),
+    root: state(counter('zulu', 1_000, { depth: 2 }), counter('alpha', 1_000, { depth: 2 })),
     middle: state(counter('middle', 1_000, { toParents: true, depth: 1 })),
     leaf: state(),
   })
   assert.deepEqual(seenBy(LEAF).map((entry) => entry[0]), ['middle', 'alpha', 'zulu'])
+})
+
+test('push targets mirror the downward scope', () => {
+  const { targetsFor } = fixture({})
+  assert.deepEqual(targetsFor(ROOT, counter('down')), [['middle', 'descendant', 1], ['leaf', 'descendant', 2]])
+})
+
+test('push targets mirror the upward scope', () => {
+  const { targetsFor } = fixture({})
+  assert.deepEqual(
+    targetsFor(LEAF, counter('up', 1_000, { toChildren: false, toParents: true })),
+    [['middle', 'ancestor', 1], ['root', 'ancestor', 2]],
+  )
+})
+
+test('push targets honour depth in both directions', () => {
+  const { targetsFor } = fixture({})
+  assert.deepEqual(targetsFor(ROOT, counter('one', 1_000, { depth: 1 })), [['middle', 'descendant', 1]])
+  assert.deepEqual(
+    targetsFor(LEAF, counter('one', 1_000, { toChildren: false, toParents: true, depth: 1 })),
+    [['middle', 'ancestor', 1]],
+  )
+})
+
+test('push targets skip the unrelated session and report an unknown ancestor', () => {
+  const { targetsFor } = fixture({})
+  assert.deepEqual(targetsFor(OTHER, counter('down')), [])
+  const orphan: SessionFacts = { id: 'orphan', parentSession: 'gone' }
+  assert.deepEqual(targetsFor(orphan, counter('up', 1_000, { toParents: true, depth: 2 })), [['gone', 'ancestor', 1]])
 })

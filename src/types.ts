@@ -46,6 +46,20 @@ export const DEFAULT_COUNTER_SCOPE: CounterScope = {
   depth: 2,
 }
 
+/** What one counter call changed, as far as the related Sessions are concerned. */
+export type CounterNoticeKind = 'created' | 'restarted' | 'reset' | 'relabelled' | 'visibility' | 'removed'
+
+/** One of this plugin's tool calls whose result has not been folded yet. */
+export interface PendingCall {
+  readonly callId: string
+  /** Tool name; only this plugin's own tools are recorded. */
+  readonly tool: string
+  /** Parsed `tool/call` arguments, applied when the call's result reports success. */
+  readonly args: Readonly<Record<string, unknown>>
+  /** Instant the call was logged; a new counter's baseline when the call commits. */
+  readonly at: number
+}
+
 /** Whole per-Session state. */
 export interface TimeReminderState {
   readonly mode: TimeMode
@@ -58,4 +72,6 @@ export interface TimeReminderState {
   /** Instant of the latest model-visible message; the step-1 baseline. */
   readonly lastMessageAt: number | null
   readonly counters: readonly CounterRecord[]
+  /** Calls awaiting their result; a call commits only when that result is a success. */
+  readonly pending: readonly PendingCall[]
 }

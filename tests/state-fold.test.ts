@@ -1,0 +1,252 @@
+/**
+ * The log fold that rebuilds per-Session state.
+ *
+ * Why this file exists: the plugin must not write its own event type (DSH has no
+ * public API that marks an event `ignorable`, and an unknown required type makes
+ * the stored Session unreadable on reload). State is therefore derived from
+ * events the plugin already produces, and these tests pin the derivation:
+ * a call commits only on success, an injected reading dates `lastInjectionAt`,
+ * and an invalid call leaves the state alone instead of throwing — a fold that
+ * throws would take the Session with it.
+ *
+ * @module dsh-time-reminder/tests/state-fold.test
+ */
+
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import {
+  applySessionEvent,
+  counterChange,
+  initialState,
+  type SessionEventLike,
+} from '../src/fold.ts'
+import { DEFAULT_COUNTER_SCOPE, type TimeReminderState } from '../src/types.ts'
+
+/** The state a fresh Session folds to. */
+const fresh = (): TimeReminderState => initialState('cron', '0 0 * * *')
+
+/** Fold a whole log. */
+const fold = (events: readonly SessionEventLike[], from = fresh()): TimeReminderState =>
+  events.reduce((state, event) => applySessionEvent(state, event), from)
+
+/** One of this plugin's tool calls. */
+const call = (seq: number, time: number, name: string, args: Record<string, unknown>): SessionEventLike => ({
+  type: 'tool/call',
+  time,
+  data: { turn: 1, step: 1, callId: `call_${seq}`, name, arguments: JSON.stringify(args) },
+})
+
+/** The matching result; `isError` marks a call that failed. */
+const result = (seq: number, time: number, isError = false): SessionEventLike => ({
+  type: 'tool/result',
+  time,
+  data: { turn: 1, step: 1, message: { toolCallId: `call_${seq}`, isError, content: [] } },
+})
+
+/** One reading injected by this plugin; the `notice` form is what marks it as one. */
+const reading = (time: number): SessionEventLike => ({
+  type: 'user/message',
+  time,
+  data: { role: 'user', content: [{ type: 'text', text: 'Time sampled…' }], source: { kind: 'dsh-time-reminder', form: 'notice' } },
+})
+
+test('a successful time_mode call commits its mode and schedule', () => {
+  const state = fold([
+    call(1, 100, 'time_mode', { mode: 'turn' }),
+    result(1, 110),
+  ])
+  assert.equal(state.mode, 'turn')
+  assert.equal(state.cron, '0 0 * * *')
+  assert.deepEqual(state.pending, [])
+})
+
+test('time_mode commits a new cron expression only once its result arrives', () => {
+  const pending = fold([call(1, 100, 'time_mode', { mode: 'cron', cron: '*/5 * * * *' })])
+  assert.equal(pending.cron, '0 0 * * *')
+  assert.equal(pending.pending.length, 1)
+  const committed = applySessionEvent(pending, result(1, 110))
+  assert.equal(committed.cron, '*/5 * * * *')
+})
+
+test('a failed call commits nothing and drops its record', () => {
+  const state = fold([
+    call(1, 100, 'time_mode', { mode: 'fine' }),
+    result(1, 110, true),
+  ])
+  assert.equal(state.mode, 'cron')
+  assert.deepEqual(state.pending, [])
+})
+
+test('an invalid mode or cron expression is dropped instead of throwing', () => {
+  const state = fold([
+    call(1, 100, 'time_mode', { mode: 'sometimes' }),
+    result(1, 110),
+    call(2, 120, 'time_mode', { mode: 'cron', cron: 'not a cron' }),
+    result(2, 130),
+  ])
+  assert.equal(state.mode, 'cron')
+  assert.equal(state.cron, '0 0 * * *')
+})
+
+test('another tool\'s call is never recorded', () => {
+  const state = fold([
+    call(1, 100, 'pwsh', { command: 'echo hi' }),
+    result(1, 110),
+  ])
+  assert.deepEqual(state.pending, [])
+})
+
+test('a counter starts at the instant its call was logged', () => {
+  const state = fold([
+    call(1, 5_000, 'time_counter', { action: 'start', name: 'deploy', note: '开始部署', inject: true }),
+    result(1, 5_010),
+  ])
+  assert.deepEqual(state.counters, [{
+    name: 'deploy',
+    startedAt: 5_000,
+    note: '开始部署',
+    inject: true,
+    scope: { toChildren: true, toParents: false, depth: 2 },
+  }])
+})
+
+test('counter note, scope, and remove follow the same call-then-result path', () => {
+  const started = fold([
+    call(1, 1_000, 'time_counter', { action: 'start', name: 'deploy' }),
+    result(1, 1_010),
+    call(2, 2_000, 'time_counter', { action: 'note', name: 'deploy', note: '发布' }),
+    result(2, 2_010),
+    call(3, 3_000, 'time_counter', { action: 'scope', name: 'deploy', toParents: true, depth: 1 }),
+    result(3, 3_010),
+  ])
+  assert.equal(started.counters[0]?.note, '发布')
+  assert.deepEqual(started.counters[0]?.scope, { toChildren: true, toParents: true, depth: 1 })
+  const removed = applySessionEvent(started, call(4, 4_000, 'time_counter', { action: 'remove', name: 'deploy' }))
+  assert.deepEqual(applySessionEvent(removed, result(4, 4_010)).counters, [])
+})
+
+test('a counter action naming a missing counter changes nothing', () => {
+  const state = fold([
+    call(1, 1_000, 'time_counter', { action: 'reset', name: 'ghost' }),
+    result(1, 1_010),
+  ])
+  assert.deepEqual(state.counters, [])
+})
+
+test('an injected reading dates lastInjectionAt, but not the message baseline', () => {
+  const state = fold([reading(7_000)])
+  assert.equal(state.lastInjectionAt, 7_000)
+  assert.equal(state.lastTurnInjectionAt, 7_000)
+  assert.equal(state.lastMessageAt, null)
+})
+
+test('a user message that is not this plugin\'s reading is ignored', () => {
+  const state = fold([{
+    type: 'user/message',
+    time: 7_000,
+    data: { role: 'user', content: [], source: { kind: 'user', rpcId: 'rpc' } },
+  }])
+  assert.equal(state.lastInjectionAt, null)
+  assert.equal(state.lastMessageAt, null)
+})
+
+test('model-visible messages supply the step-1 baseline', () => {
+  const state = fold([
+    { type: 'assistant/message', time: 8_000, data: { turn: 1, step: 1 } },
+    { type: 'tool/result', time: 9_000, data: { turn: 1, step: 2, message: { toolCallId: 'x', isError: false } } },
+  ])
+  assert.equal(state.lastMessageAt, 9_000)
+})
+
+test('a turn boundary clears the open-turn reading and any unpaired call', () => {
+  const before = fold([reading(7_000), call(1, 7_100, 'time_mode', { mode: 'fine' })])
+  assert.equal(before.lastTurnInjectionAt, 7_000)
+  const after = applySessionEvent(before, { type: 'turn/end', time: 7_200, data: { turn: 1 } })
+  assert.equal(after.lastTurnInjectionAt, null)
+  assert.deepEqual(after.pending, [])
+  assert.equal(after.lastInjectionAt, 7_000)
+})
+
+test('folding the same log twice reaches the same state', () => {
+  const log = [
+    reading(1_000),
+    call(1, 1_100, 'time_counter', { action: 'start', name: 'deploy' }),
+    result(1, 1_110),
+    { type: 'assistant/message', time: 1_200, data: { turn: 1, step: 1 } },
+    { type: 'turn/end', time: 1_300, data: { turn: 1 } },
+    call(2, 1_400, 'time_mode', { mode: 'fine' }),
+    result(2, 1_410),
+    reading(1_500),
+  ]
+  assert.deepEqual(fold(log), fold(log))
+})
+
+test('the fold covers every field the projection schema declares', () => {
+  // The schema itself lives in `../src/state.ts`, which needs `zod`; the DSH
+  // runtime validates the folded state with it on every apply, so a field added
+  // here without a matching schema entry fails loudly at load rather than
+  // silently dropping state. This test pins the field set instead of the schema.
+  const folded = fold([
+    reading(1_000),
+    call(1, 1_100, 'time_counter', { action: 'start', name: 'deploy' }),
+    result(1, 1_110),
+  ])
+  assert.deepEqual(Object.keys(folded).sort(), ['counters', 'cron', 'lastInjectionAt', 'lastMessageAt', 'lastTurnInjectionAt', 'mode', 'pending'])
+})
+
+test('a counter notice pushed from a related session is not a reading', () => {
+  // The notice carries the same source kind but the `relay` form, so it must not
+  // date `lastInjectionAt`: otherwise a notice would skew cron due-ness and the
+  // turn cadence of the Session that received it.
+  const state = fold([{
+    type: 'user/message',
+    time: 7_000,
+    data: {
+      role: 'user',
+      content: [{ type: 'text', text: '<system-reminder>[counters] "x" was created…</system-reminder>' }],
+      source: { kind: 'dsh-time-reminder', form: 'relay', senderSessionId: 'session-other' },
+    },
+  }])
+  assert.equal(state.lastInjectionAt, null)
+  assert.equal(state.lastTurnInjectionAt, null)
+  assert.equal(state.lastMessageAt, null)
+})
+
+test('every mutating counter action reports what to announce', () => {
+  const args = (action: string, extra: Record<string, unknown> = {}) => ({ action, name: 'deploy', ...extra })
+  const empty = fresh()
+
+  const created = counterChange(empty, args('start', { note: '开始', inject: true }), 1_000)
+  assert.equal(created.announced?.kind, 'created')
+  assert.equal(created.announced?.counter.startedAt, 1_000)
+  assert.equal(created.announced?.previous, undefined)
+
+  const restarted = counterChange(created.state, args('start'), 2_000)
+  assert.equal(restarted.announced?.kind, 'restarted')
+  assert.equal(restarted.announced?.previous?.startedAt, 1_000)
+  assert.equal(restarted.announced?.counter.note, undefined, 'a restart replaces the label')
+
+  const reset = counterChange(created.state, args('reset'), 2_000)
+  assert.equal(reset.announced?.kind, 'reset')
+  assert.equal(reset.announced?.counter.startedAt, 2_000)
+  assert.equal(reset.announced?.counter.note, '开始', 'a reset keeps the label')
+
+  const relabelled = counterChange(created.state, args('note', { note: '发布' }), 2_000)
+  assert.equal(relabelled.announced?.kind, 'relabelled')
+  assert.equal(relabelled.announced?.counter.note, '发布')
+
+  const visibility = counterChange(created.state, args('scope', { toParents: true, depth: 1 }), 2_000)
+  assert.equal(visibility.announced?.kind, 'visibility')
+  assert.deepEqual(visibility.announced?.counter.scope, { ...DEFAULT_COUNTER_SCOPE, toParents: true, depth: 1 })
+  assert.deepEqual(visibility.announced?.previous?.scope, DEFAULT_COUNTER_SCOPE, 'the old scope travels with the notice')
+
+  const removed = counterChange(created.state, args('remove'), 2_000)
+  assert.equal(removed.announced?.kind, 'removed')
+  assert.equal(removed.announced?.counter.name, 'deploy')
+})
+
+test('read-only counter actions announce nothing', () => {
+  const state = counterChange(fresh(), { action: 'start', name: 'deploy' }, 1_000).state
+  assert.equal(counterChange(state, { action: 'lapse', name: 'deploy' }, 2_000).announced, undefined)
+  assert.equal(counterChange(state, { action: 'list' }, 2_000).announced, undefined)
+})

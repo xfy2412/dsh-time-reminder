@@ -1,0 +1,17 @@
+# dsh-time-reminder 宿主插件：可调精度的时钟上下文 + 会话内计时器。
+#
+# 挂载说明：
+#   · 本文件由 profile 加载器作为 bundle 补丁读入，把插件插进配置树；
+#   · 官方 @deepseek-ai/dsh-time-context 不在任何随包 bundle 里，因此无需禁用它
+#     （若将来某组合引了它，需在同层 patch 里 `disabled: true`，否则每步会有两条读数）；
+#   · 配置项含义见 README.md。
+- insert:
+    - id: time-reminder
+      name: 'dsh-time-reminder'
+      config:
+        # 会话初始精度；可随时用 time_mode 工具切换，切换会写进会话状态。
+        defaultMode: cron
+        # cron 模式的初始计划；跨过该时刻就注入一次。同样可被 time_mode 覆盖。
+        cron: '0 0 * * *'
+        # fine 模式的最小注入间隔；0 表示每个步骤都注入（约 19 条/轮）。
+        fineIntervalMs: 0
