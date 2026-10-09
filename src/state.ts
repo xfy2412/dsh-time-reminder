@@ -23,7 +23,7 @@ export const STATE_EVENT_TYPE = 'time-reminder/state'
 
 /** Zod schema for {@link TimeReminderState}; persisted state is validated with it. */
 export const timeReminderStateSchema = z.object({
-  mode: z.union([z.literal('off'), z.literal('cron'), z.literal('fine')]),
+  mode: z.union([z.literal('off'), z.literal('cron'), z.literal('turn'), z.literal('fine')]),
   cron: z.string(),
   lastInjectionAt: z.number().nullable(),
   lastTurnInjectionAt: z.number().nullable(),
@@ -93,7 +93,7 @@ export function stateFromEventData(type: string, data: unknown, fallbackCron: st
   if (type !== STATE_EVENT_TYPE) return undefined
   if (data === null || typeof data !== 'object') return undefined
   const candidate = data as Partial<StateEventData>
-  if (candidate.mode !== 'off' && candidate.mode !== 'cron' && candidate.mode !== 'fine') return undefined
+  if (candidate.mode !== 'off' && candidate.mode !== 'cron' && candidate.mode !== 'turn' && candidate.mode !== 'fine') return undefined
   if (!Array.isArray(candidate.counters)) return undefined
   return {
     mode: candidate.mode,

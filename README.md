@@ -8,18 +8,21 @@
 "这次等了 20 秒"还是"等了 20 分钟"。官方 `@deepseek-ai/dsh-time-context` 能做基础注入，但
 **不提供工具**、且刷新间隔在加载时被闭包固定，会话中改不了。本插件把控制权交给模型和你。
 
-## 三种时间模式（每会话独立，随会话日志持久化）
+## 四种时间模式（每会话独立，随会话日志持久化）
 
 | 模式 | 行为 | 用途 |
 |---|---|---|
 | `cron`（默认） | 跨过 cron 触发时刻注入一次；默认 `0 0 * * *`（每天 00:00，按你的浏览器时区） | 日常：知道今天几号、大概几点 |
 | `off` | **不自动注入**；工具照常可查时间与计时器 | 上下文要干净时 |
+| `turn` | **每轮恰好一次**，在该轮第一步（即你发消息之后那一步）；给出距上一条模型可见消息的间隔 | 想每轮都知道"距上轮结束多久"，又不想每步都注入 |
 | `fine` | **每个步骤都注入**（含每次工具调用之后） | 精确计时、要步间耗时 |
+
+粒度谱：`off` < `cron`（按时间）< `turn`（每轮 1 条）< `fine`（每步约 19 条，实测均值）。
 
 ## 工具
 
 ```
-time_mode     mode: off | cron | fine        可选 cron: "<表达式>"
+time_mode     mode: off | cron | turn | fine   可选 cron: "<表达式>"
               切换精度；cron 表达式按会话时区解释
 
 time_counter  action: start | lapse | list | note | scope | reset | remove
@@ -61,7 +64,7 @@ Elapsed since the preceding model-visible message: 3m7s
     - id: time-reminder
       name: 'dsh-time-reminder'
       config:
-        defaultMode: cron          # off | cron | fine
+        defaultMode: cron          # off | cron | turn | fine
         cron: '0 0 * * *'          # 默认每天 00:00
         timeZone: Asia/Shanghai    # 缺省时用浏览器时区，再缺省用进程时区
         fineIntervalMs: 0          # fine 模式的最小间隔；0 = 每步都注入

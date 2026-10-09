@@ -8,7 +8,7 @@
  */
 
 /** Time mode controlling automatic injection; each Session owns its own value. */
-export type TimeMode = 'off' | 'cron' | 'fine'
+export type TimeMode = 'off' | 'cron' | 'turn' | 'fine'
 
 /** Scope policy for one counter: whether it crosses a lineage boundary, and how far. */
 export interface CounterScope {

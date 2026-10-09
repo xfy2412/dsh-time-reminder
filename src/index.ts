@@ -83,7 +83,7 @@ export interface Config {
 export const Config: z<Config> = z.object({
   timeZone: z.string(),
   cron: z.string().default(DEFAULT_CRON),
-  defaultMode: z.union(['off', 'cron', 'fine'] as const).default('cron'),
+  defaultMode: z.union(['off', 'cron', 'turn', 'fine'] as const).default('cron'),
   fineIntervalMs: z.number().step(1).min(0).default(0),
 })
 
@@ -205,6 +205,9 @@ export function apply(ctx: Context, config: Config): void {
     const now = Date.now()
     const zone = displayZone(decision.messages)
     const expression = expressionOf(state)
+    // `turn` reads once per turn, at the first step — the step that follows the
+    // user's message. `cron` and `fine` keep their own schedules.
+    if (state.mode === 'turn' && step !== 1) return decision
     if (state.mode === 'cron' && !cronDue(expression, zone, state.lastInjectionAt ?? undefined, now)) {
       return decision
     }
@@ -230,9 +233,13 @@ export function apply(ctx: Context, config: Config): void {
       zone,
       cron: expression,
       fresh: step === 1,
-      ...step === 1
-        ? state.lastMessageAt === null ? {} : { sinceMessageMs: now - state.lastMessageAt }
-        : state.lastTurnInjectionAt === null ? {} : { sinceReadingMs: now - state.lastTurnInjectionAt },
+      // `turn` reads only at step 1 and always reports the gap to the previous turn;
+      // `cron`/`fine` distinguish the first step from later ones.
+      ...state.mode === 'turn'
+        ? state.lastMessageAt === null ? {} : { sinceLastMessageMs: now - state.lastMessageAt }
+        : step === 1
+          ? state.lastMessageAt === null ? {} : { sinceMessageMs: now - state.lastMessageAt }
+          : state.lastTurnInjectionAt === null ? {} : { sinceReadingMs: now - state.lastTurnInjectionAt },
       ...state.lastInjectionAt === null ? {} : { lastInjectionAt: state.lastInjectionAt },
       counters,
     })
@@ -257,12 +264,12 @@ export function apply(ctx: Context, config: Config): void {
   // ── tools (available in every mode, including `off`) ───────────────────────
   ctx.tools.register(defineTool({
     name: TIME_MODE_TOOL,
-    description: 'Set how often the current time is injected into your context in this session. off: never inject automatically, though you can still read the clock by calling this tool. cron: inject once whenever the configured schedule is crossed (default daily 00:00). fine: inject on every step, for precise timing and step durations.',
+    description: 'Set how often the current time is injected into your context in this session. off: never inject automatically, though you can still read the clock by calling this tool. cron: inject once whenever the configured schedule is crossed (default daily 00:00). turn: inject exactly once per turn, at the first step after the user message, which reports how long the previous turn has been over. fine: inject on every step, for precise timing and step durations.',
     parameters: {
       mode: {
         type: 'string',
         required: true,
-        enum: ['off', 'cron', 'fine'],
+        enum: ['off', 'cron', 'turn', 'fine'],
         description: 'The precision to use from now on in this session.',
       },
       cron: {
@@ -291,8 +298,8 @@ export function apply(ctx: Context, config: Config): void {
       const session = requireSession(exec)
       const state = stateOf(session.header.id)
       const mode = args.mode as TimeMode
-      if (mode !== 'off' && mode !== 'cron' && mode !== 'fine') {
-        throw new TypeError(`invalid time mode ${JSON.stringify(args.mode)}; expected off, cron, or fine`)
+      if (mode !== 'off' && mode !== 'cron' && mode !== 'turn' && mode !== 'fine') {
+        throw new TypeError(`invalid time mode ${JSON.stringify(args.mode)}; expected off, cron, turn, or fine`)
       }
       const requested = typeof args.cron === 'string' && args.cron.length > 0 ? args.cron : undefined
       const activeText = requested ?? state.cron
@@ -308,7 +315,9 @@ export function apply(ctx: Context, config: Config): void {
           ? 'Automatic readings are off. Call this tool whenever you need the current time.'
           : mode === 'cron'
             ? 'A reading is injected whenever the schedule is crossed, and at the first step of a turn after a gap.'
-            : 'A reading accompanies every step, including after each tool call.',
+            : mode === 'turn'
+              ? 'One reading per turn, at the first step, reporting how long the previous turn has been over.'
+              : 'A reading accompanies every step, including after each tool call.',
       }
     },
   }))

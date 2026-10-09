@@ -35,6 +35,15 @@ export interface ReadingInput {
   readonly fresh: boolean
   /** Elapsed since the preceding model-visible message; first step only. */
   readonly sinceMessageMs?: number
+  /**
+   * Elapsed since the preceding model-visible message, reported on any step.
+   *
+   * `turn` mode injects once per turn, so this is the only baseline it can offer —
+   * it answers "how long since the previous turn stopped". Other modes use
+   * {@link sinceMessageMs} / {@link sinceReadingMs}, which distinguish the first
+   * step from later ones.
+   */
+  readonly sinceLastMessageMs?: number
   /** Elapsed since the preceding reading in this turn; later steps only. */
   readonly sinceReadingMs?: number
   /** Instant of the previous reading, shown for `cron` mode's traceability. */
@@ -125,14 +134,21 @@ export function renderReading(input: ReadingInput): string {
       lines.push(`Time mode: cron (${describeSchedule(input.cron, input.zone)}; previous reading ${last})`)
       break
     }
+    case 'turn':
+      lines.push('Time mode: turn (one reading at the first step of every turn)')
+      break
     case 'fine':
       lines.push(`Time mode: fine (a reading accompanies every step; zone ${input.zone})`)
       break
   }
-  const since = input.fresh ? input.sinceMessageMs : input.sinceReadingMs
-  lines.push(input.fresh
-    ? `Elapsed since the preceding model-visible message: ${since === undefined ? 'unavailable' : formatDuration(since)}`
-    : `Elapsed since the preceding step context: ${since === undefined ? 'unavailable' : formatDuration(since)}`)
+  if (input.sinceLastMessageMs !== undefined) {
+    lines.push(`Elapsed since the preceding model-visible message: ${formatDuration(input.sinceLastMessageMs)}`)
+  } else {
+    const since = input.fresh ? input.sinceMessageMs : input.sinceReadingMs
+    lines.push(input.fresh
+      ? `Elapsed since the preceding model-visible message: ${since === undefined ? 'unavailable' : formatDuration(since)}`
+      : `Elapsed since the preceding step context: ${since === undefined ? 'unavailable' : formatDuration(since)}`)
+  }
   if (input.counters.length > 0) {
     lines.push(`[counters] ${input.counters.map((counter) =>
       `${counter.name}=${formatDuration(counter.elapsedMs)}${counter.note === undefined ? '' : ` (${counter.note})`}`).join('  ')}`)

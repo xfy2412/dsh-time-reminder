@@ -90,6 +90,41 @@ test('renderReading switches the baseline on later steps', () => {
   ].join('\n'))
 })
 
+test('renderReading renders turn mode with the previous-turn gap on any step', () => {
+  // `turn` injects only at a turn's first step, but the renderer must not assume it:
+  // it always reports the gap to the preceding model-visible message.
+  const text = renderReading({
+    now: Date.parse('2026-10-09T09:00:00+08:00'),
+    turn: 20,
+    step: 1,
+    zone: ZONE,
+    mode: 'turn',
+    cron: DAILY,
+    fresh: true,
+    sinceLastMessageMs: 7_200_000,
+    counters: [],
+  })
+  assert.equal(text, [
+    'Time sampled while preparing turn 20, step 1: 2026-10-09T09:00:00+08:00[Asia/Shanghai]',
+    'Time mode: turn (one reading at the first step of every turn)',
+    'Elapsed since the preceding model-visible message: 2h0m',
+  ].join('\n'))
+})
+
+test('renderReading reports turn mode without a baseline as unavailable', () => {
+  const text = renderReading({
+    now: Date.parse('2026-10-09T09:00:00+08:00'),
+    turn: 1,
+    step: 1,
+    zone: ZONE,
+    mode: 'turn',
+    cron: DAILY,
+    fresh: true,
+    counters: [],
+  })
+  assert.match(text, /preceding model-visible message: unavailable/)
+})
+
 test('renderReading reports an unavailable baseline instead of guessing', () => {
   const text = renderReading({
     now: Date.parse('2026-10-09T01:24:00+08:00'),
