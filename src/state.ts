@@ -24,6 +24,7 @@ export const STATE_EVENT_TYPE = 'time-reminder/state'
 /** Zod schema for {@link TimeReminderState}; persisted state is validated with it. */
 export const timeReminderStateSchema = z.object({
   mode: z.union([z.literal('off'), z.literal('cron'), z.literal('fine')]),
+  cron: z.string(),
   lastInjectionAt: z.number().nullable(),
   lastTurnInjectionAt: z.number().nullable(),
   lastMessageAt: z.number().nullable(),
@@ -33,7 +34,6 @@ export const timeReminderStateSchema = z.object({
     note: z.string().optional(),
     inject: z.boolean(),
     scope: z.object({
-      crossSession: z.boolean(),
       toChildren: z.boolean(),
       toParents: z.boolean(),
       depth: z.number(),
@@ -42,9 +42,10 @@ export const timeReminderStateSchema = z.object({
 })
 
 /** State of an empty log. */
-export function initialState(mode: TimeMode): TimeReminderState {
+export function initialState(mode: TimeMode, cron: string): TimeReminderState {
   return {
     mode,
+    cron,
     lastInjectionAt: null,
     lastTurnInjectionAt: null,
     lastMessageAt: null,
@@ -70,6 +71,7 @@ export function withoutCounter(state: TimeReminderState, name: string): TimeRemi
 /** Shape of the JSON payload carried by {@link STATE_EVENT_TYPE}. */
 export interface StateEventData {
   readonly mode: TimeMode
+  readonly cron: string
   readonly counters: readonly CounterRecord[]
   readonly lastInjectionAt: number | null
   readonly lastTurnInjectionAt: number | null
@@ -84,9 +86,10 @@ export interface StateEventData {
  *
  * @param type - the committed event's type.
  * @param data - its payload.
+ * @param fallbackCron - schedule to assume for revisions written before `cron` was stored.
  * @returns the state to adopt, or `undefined` when this is not a state event.
  */
-export function stateFromEventData(type: string, data: unknown): TimeReminderState | undefined {
+export function stateFromEventData(type: string, data: unknown, fallbackCron: string): TimeReminderState | undefined {
   if (type !== STATE_EVENT_TYPE) return undefined
   if (data === null || typeof data !== 'object') return undefined
   const candidate = data as Partial<StateEventData>
@@ -94,6 +97,7 @@ export function stateFromEventData(type: string, data: unknown): TimeReminderSta
   if (!Array.isArray(candidate.counters)) return undefined
   return {
     mode: candidate.mode,
+    cron: typeof candidate.cron === 'string' && candidate.cron.length > 0 ? candidate.cron : fallbackCron,
     counters: candidate.counters as readonly CounterRecord[],
     lastInjectionAt: nullableNumber(candidate.lastInjectionAt),
     lastTurnInjectionAt: nullableNumber(candidate.lastTurnInjectionAt),

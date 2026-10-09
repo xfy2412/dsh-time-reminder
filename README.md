@@ -23,7 +23,7 @@ time_mode     mode: off | cron | fine        可选 cron: "<表达式>"
               切换精度；cron 表达式按会话时区解释
 
 time_counter  action: start | lapse | list | note | scope | reset | remove
-              name, note, inject, crossSession, toChildren, toParents, depth
+              name, note, inject, toChildren, toParents, depth
               建/查/改计时器；可见性属性在调用时设置
 ```
 
@@ -32,10 +32,13 @@ time_counter  action: start | lapse | list | note | scope | reset | remove
 | 属性 | 默认 | 含义 |
 |---|---|---|
 | `inject` | `false` | 是否加入每次自动读数 |
-| `crossSession` | `false` | 是否让**其它会话**也能读到（给"同一件事开多个会话并行"的场景） |
 | `toChildren` | `true` | 是否让**子代理**读到 |
 | `toParents` | `false` | 是否让**父代理**读到 |
 | `depth` | `2` | 可见性沿谱系穿透**几代**（1 = 直接父子，2 = 也含祖孙） |
+
+计数器只存在于自己会话的状态里（随会话日志持久化），不跨会话共享。
+`cron` 表达式同样是**每会话状态**：用 `time_mode` 改过之后，写进 `time-reminder/state` 事件，
+恢复会话仍然沿用。
 
 ## 注入读数长这样
 
@@ -76,7 +79,7 @@ Elapsed since the preceding model-visible message: 3m7s
 ## 已知限制
 
 - `fine` 模式每步一条读数，会累积到被压缩遮蔽为止（token 成本）——这也是它默认不启用的原因。
-- `crossSession: true` 的计数器**不进会话日志**，历史回放时无法重建其当时取值。
+- 计数器**不跨会话共享**：只在本会话谱系内（父/子，受 `toParents`/`toChildren`/`depth` 控制）可见。
 - cron 判定用挂钟：系统时间回拨可能导致同一触发点重复注入或漏注入。
 - 桌面端 profile 尚未挂载；目前只在 web profile 开发。
 

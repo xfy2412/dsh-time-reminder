@@ -10,13 +10,8 @@
 /** Time mode controlling automatic injection; each Session owns its own value. */
 export type TimeMode = 'off' | 'cron' | 'fine'
 
-/** Scope policy for one counter: who may see it, and how far the relation reaches. */
+/** Scope policy for one counter: whether it crosses a lineage boundary, and how far. */
 export interface CounterScope {
-  /**
-   * Whether other Sessions may read it. Off by default: a Session-local counter is
-   * reconstructible from that Session's log, while a shared one is not.
-   */
-  readonly crossSession: boolean
   /** Whether Sessions delegated from this one may read it. */
   readonly toChildren: boolean
   /** Whether this Session's ancestors may read it. */
@@ -42,11 +37,10 @@ export interface CounterRecord {
 }
 
 /**
- * Default scope for a new counter: Session-local, exposed downward two
- * generations (child and grandchild), never upward.
+ * Default scope for a new counter: exposed downward two generations (child and
+ * grandchild), never upward.
  */
 export const DEFAULT_COUNTER_SCOPE: CounterScope = {
-  crossSession: false,
   toChildren: true,
   toParents: false,
   depth: 2,
@@ -55,6 +49,8 @@ export const DEFAULT_COUNTER_SCOPE: CounterScope = {
 /** Whole per-Session state. */
 export interface TimeReminderState {
   readonly mode: TimeMode
+  /** Cron expression in force for this Session, independent of the configured default. */
+  readonly cron: string
   /** Instant of this plugin's latest reading in this Session. */
   readonly lastInjectionAt: number | null
   /** Instant of the latest reading in the open turn. */

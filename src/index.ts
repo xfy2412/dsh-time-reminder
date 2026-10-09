@@ -117,20 +117,30 @@ interface MessageLike {
  */
 export function apply(ctx: Context, config: Config): void {
   const fallbackTimeZone = resolveFallbackTimeZone(config.timeZone)
-  const expression = parseCron(config.cron ?? DEFAULT_CRON)
+  const configuredCron = config.cron ?? DEFAULT_CRON
+  const defaultExpression = parseCron(configuredCron)
   const defaultMode: TimeMode = config.defaultMode ?? 'cron'
   const fineIntervalMs = config.fineIntervalMs ?? 0
   if (!Number.isSafeInteger(fineIntervalMs) || fineIntervalMs < 0) {
     throw new TypeError(`time-reminder: fineIntervalMs must be a non-negative safe integer, got ${String(fineIntervalMs)}`)
+  }
+  /** Parse one Session's schedule, refusing a corrupt stored expression loudly. */
+  const expressionOf = (state: TimeReminderState): CronExpression => {
+    if (state.cron === configuredCron) return defaultExpression
+    try {
+      return parseCron(state.cron)
+    } catch (error) {
+      throw new TypeError(`time-reminder: session stores an invalid cron expression ${JSON.stringify(state.cron)}`, { cause: error })
+    }
   }
 
   ctx.sessionProjections.register({
     key: 'time-reminder',
     stateVersion: 1,
     stateSchema: timeReminderStateSchema,
-    init: () => initialState(defaultMode),
+    init: () => initialState(defaultMode, configuredCron),
     apply: (state, event) => {
-      const committed = stateFromEventData(event.type, event.data)
+      const committed = stateFromEventData(event.type, event.data, configuredCron)
       if (committed !== undefined) return committed
       if (event.type === 'turn/start' || event.type === 'turn/end') {
         return state.lastTurnInjectionAt === null ? state : { ...state, lastTurnInjectionAt: null }
@@ -147,14 +157,15 @@ export function apply(ctx: Context, config: Config): void {
   /** Read one Session's committed state. */
   const stateOf = (sessionId: string): TimeReminderState => {
     const session = ctx.sessions.get(sessionId as never)
-    if (session === undefined) return initialState(defaultMode)
-    return ctx.sessionProjections.stateOf(session, 'time-reminder') ?? initialState(defaultMode)
+    if (session === undefined) return initialState(defaultMode, configuredCron)
+    return ctx.sessionProjections.stateOf(session, 'time-reminder') ?? initialState(defaultMode, configuredCron)
   }
 
   /** Commit a state revision; the projection folds it back in. */
   const commit = (session: SessionHandle, state: TimeReminderState): void => {
     session.append(STATE_EVENT_TYPE as never, {
       mode: state.mode,
+      cron: state.cron,
       counters: state.counters,
       lastInjectionAt: state.lastInjectionAt,
       lastTurnInjectionAt: state.lastTurnInjectionAt,
@@ -193,6 +204,7 @@ export function apply(ctx: Context, config: Config): void {
 
     const now = Date.now()
     const zone = displayZone(decision.messages)
+    const expression = expressionOf(state)
     if (state.mode === 'cron' && !cronDue(expression, zone, state.lastInjectionAt ?? undefined, now)) {
       return decision
     }
@@ -283,9 +295,10 @@ export function apply(ctx: Context, config: Config): void {
         throw new TypeError(`invalid time mode ${JSON.stringify(args.mode)}; expected off, cron, or fine`)
       }
       const requested = typeof args.cron === 'string' && args.cron.length > 0 ? args.cron : undefined
-      const active = requested === undefined ? expression : parseCron(requested)
+      const activeText = requested ?? state.cron
+      const active = requested === undefined ? expressionOf(state) : parseCron(requested)
       const zone = displayZone([])
-      commit(session, { ...state, mode })
+      commit(session, { ...state, mode, cron: activeText })
       return {
         mode,
         schedule: describeSchedule(active, zone),
@@ -322,10 +335,6 @@ export function apply(ctx: Context, config: Config): void {
         type: 'boolean',
         description: 'Whether this counter joins every automatic reading (start, scope). Defaults to false when starting.',
       },
-      crossSession: {
-        type: 'boolean',
-        description: 'Whether other sessions may read it (scope). Off by default: a shared counter is no longer reconstructible from this session log.',
-      },
       toChildren: {
         type: 'boolean',
         description: 'Whether sessions delegated from this one may read it (scope). Defaults to true.',
@@ -357,7 +366,6 @@ export function apply(ctx: Context, config: Config): void {
                 startedAt: { type: 'string', required: true },
                 note: { type: 'string' },
                 inject: { type: 'boolean', required: true },
-                crossSession: { type: 'boolean', required: true },
                 toChildren: { type: 'boolean', required: true },
                 toParents: { type: 'boolean', required: true },
                 depth: { type: 'integer', required: true },
@@ -374,7 +382,7 @@ export function apply(ctx: Context, config: Config): void {
           ? 'No counters are visible in this session.'
           : value.counters.map((counter) =>
             `- ${counter.name} = ${counter.elapsed}${counter.note === undefined ? '' : ` (${counter.note})`}`
-            + `  [started ${counter.startedAt}; inject=${counter.inject}; crossSession=${counter.crossSession};`
+            + `  [started ${counter.startedAt}; inject=${counter.inject};`
             + ` children=${counter.toChildren}; parents=${counter.toParents}; depth=${counter.depth}; origin=${counter.origin}]`).join('\n')}\n${value.note}`,
       }],
     },
@@ -449,7 +457,6 @@ export function apply(ctx: Context, config: Config): void {
           startedAt: formatTimestamp(resolved.counter.startedAt, zone),
           ...resolved.counter.note === undefined ? {} : { note: resolved.counter.note },
           inject: resolved.counter.inject,
-          crossSession: resolved.counter.scope.crossSession,
           toChildren: resolved.counter.scope.toChildren,
           toParents: resolved.counter.scope.toParents,
           depth: resolved.counter.scope.depth,
@@ -500,7 +507,6 @@ function scopeFromArgs(args: Record<string, unknown>, previous: CounterScope): C
     throw new TypeError(`time-reminder: depth must be a non-negative safe integer, got ${String(args.depth)}`)
   }
   return {
-    crossSession: args.crossSession === undefined ? previous.crossSession : args.crossSession === true,
     toChildren: args.toChildren === undefined ? previous.toChildren : args.toChildren === true,
     toParents: args.toParents === undefined ? previous.toParents : args.toParents === true,
     depth: depth as number,

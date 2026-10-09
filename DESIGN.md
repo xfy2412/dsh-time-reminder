@@ -25,7 +25,7 @@ DSH 0.2.0 自带 `@deepseek-ai/dsh-time-context`，但它有两条硬限制：
 
 ## 计数器（计时器）
 
-一个计数器 = 一个基准时刻 + 描述 + 一组属性。默认**会话内**。
+一个计数器 = 一个基准时刻 + 描述 + 一组可见性属性。只存在于**本会话**的状态里（随会话日志持久化）。
 
 ```yaml
 counters:
@@ -34,18 +34,15 @@ counters:
     note: 开始部署
     inject: false           # 是否随时间注入到每步读数
     scope:
-      crossSession: false   # 跨会话共享（给"同一件事开多个会话并行"的人）
       toChildren: true      # 子代理可见
       toParents: false      # 父代理可见
-      depth: 1              # 沿 parentSession 穿透层数
+      depth: 2              # 沿 parentSession 穿透几代（1 = 直接父子，2 = 也含祖孙）
 ```
 
-**默认值均为保守**：不跨会话、只向下暴露一层、不注入。
+**默认值均为保守**：只向下暴露两代、不向上暴露、不注入。
 
-- `crossSession: false` ⇒ 计数器只在本会话状态里，随本会话日志持久化；
-- `crossSession: true` ⇒ 登记到插件级共享存储（`ctx.storage`），其它会话可读；
-  注意它**不进会话日志**，因此历史回放时看不到它当时的取值——这是可审计性的取舍。
-- 父子可见性沿 `session.header.parentSession` 上溯、`ctx.sessions.list()` 下探，`depth` 限层数。
+父子可见性沿 `session.header.parentSession` 上溯、`ctx.sessions.list()` 下探，`depth` 限代数。
+同名时**近者胜**（自己的计数器永远遮蔽继承来的）。
 
 ## 状态如何落盘
 
