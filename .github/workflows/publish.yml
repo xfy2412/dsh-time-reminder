@@ -1,11 +1,21 @@
 # Release: push a `v*` tag (or run this workflow by hand) and the package goes to
-# the npm registry.
+# the npm registry through **trusted publishing (OIDC)** — no long-lived token.
 #
-# Requires one repository secret: NPM_TOKEN — an npm automation token with
-# publish rights for `dsh-time-reminder`.
+# One-time setup, run once from a machine logged into npm as the package owner:
 #
-# `pnpm publish` runs the `prepack` script, so the tarball is built from `src/`
-# in this checkout; `lib/` is never taken from git.
+#   npm trust github dsh-time-reminder \
+#     --repo xfy2412/dsh-time-reminder --file publish.yml --allow-publish
+#
+# After that this workflow authenticates by exchanging the GitHub OIDC token
+# (`id-token: write`) for a short-lived npm credential, and npm attaches a
+# provenance attestation automatically.
+#
+# `npm publish` (not `pnpm publish`) runs the publish step: npm 11.5.1+ performs
+# the trusted-publishing exchange, while pnpm's publish command documents only
+# `--provenance` and no OIDC flow. Everything else here stays on pnpm.
+#
+# If trusted publishing is not configured, fall back to a token by uncommenting
+# the `env:` block on the publish step and adding an NPM_TOKEN secret.
 name: publish
 
 on:
@@ -15,6 +25,8 @@ on:
 
 permissions:
   contents: read
+  # Required for the OIDC exchange; without it npm cannot authenticate.
+  id-token: write
 
 jobs:
   publish:
@@ -26,6 +38,8 @@ jobs:
           version: 12
       - uses: actions/setup-node@v4
         with:
+          # Registry only: with trusted publishing there is no NODE_AUTH_TOKEN to
+          # wire up.
           node-version: 24
           registry-url: https://registry.npmjs.org
           cache: pnpm
@@ -41,9 +55,7 @@ jobs:
             echo "tag ${GITHUB_REF_NAME} does not match package version ${version}" >&2
             exit 1
           fi
-      # `--no-git-checks` keeps the publish independent of branch and tag state;
-      # the tag that triggered this run is the version authority. The package is
-      # unscoped, so it defaults to public access.
-      - run: pnpm publish --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # `prepack` builds lib/ here, so the tarball always matches src/.
+      - run: npm publish
+        # env:
+        #   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
