@@ -1,21 +1,29 @@
 # Release: push a `v*` tag (or run this workflow by hand) and the package goes to
 # the npm registry through **trusted publishing (OIDC)** — no long-lived token.
 #
-# One-time setup, run once from a machine logged into npm as the package owner:
+# One-time setup, in this order:
 #
-#   npm trust github dsh-time-reminder \
-#     --repo xfy2412/dsh-time-reminder --file publish.yml --allow-publish
+#   1. Bootstrap the package name. npm refuses to attach a trusted publisher to a
+#      package that does not exist yet (`POST /-/package/<name>/trust` answers
+#      404), so the FIRST version is published by hand:
 #
-# After that this workflow authenticates by exchanging the GitHub OIDC token
-# (`id-token: write`) for a short-lived npm credential, and npm attaches a
-# provenance attestation automatically.
+#        pnpm run check && npm publish        # interactive; npm asks for 2FA
+#
+#      (Alternative for a non-interactive first release: an npm *automation*
+#      token in an NPM_TOKEN secret, with the `env:` block below uncommented.
+#      Delete that secret once trusted publishing is configured.)
+#   2. Attach this workflow as the trusted publisher:
+#
+#        npm trust github dsh-time-reminder \
+#          --repo xfy2412/dsh-time-reminder --file publish.yml --allow-publish
+#
+#   3. Every later version needs nothing but a tag: the run exchanges the GitHub
+#      OIDC token (`id-token: write`) for a short-lived npm credential, and npm
+#      attaches a provenance attestation automatically.
 #
 # `npm publish` (not `pnpm publish`) runs the publish step: npm 11.5.1+ performs
 # the trusted-publishing exchange, while pnpm's publish command documents only
 # `--provenance` and no OIDC flow. Everything else here stays on pnpm.
-#
-# If trusted publishing is not configured, fall back to a token by uncommenting
-# the `env:` block on the publish step and adding an NPM_TOKEN secret.
 name: publish
 
 on:
@@ -55,7 +63,20 @@ jobs:
             echo "tag ${GITHUB_REF_NAME} does not match package version ${version}" >&2
             exit 1
           fi
+      # Re-running a tag (or tagging the version that bootstrapped the name) must
+      # not fail on an already-published version.
+      - id: published
+        run: |
+          name="$(node -p 'require("./package.json").name')"
+          version="$(node -p 'require("./package.json").version')"
+          if npm view "${name}@${version}" version >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "${name}@${version} is already on the registry; nothing to publish."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
       # `prepack` builds lib/ here, so the tarball always matches src/.
-      - run: npm publish
+      - if: steps.published.outputs.skip != 'true'
+        run: npm publish
         # env:
         #   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
