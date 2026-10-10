@@ -201,13 +201,51 @@ function weekdayOf(at: number, timeZone: string): number {
 
 /**
  * Describe a schedule for the model-facing reading line.
+ *
+ * The phrasing answers the question a reading actually raises — "how soon will
+ * the next one come, and when?" — so recurring shapes are named rather than
+ * echoed: `every 2 minutes`, `hourly at :15`, `daily 03:30`. A schedule with a
+ * day, month, or weekday restriction keeps its raw expression, because folding
+ * those into prose risks dropping a constraint the model would then mis-plan on.
+ *
  * @param expression - the parsed schedule.
  * @param timeZone - the zone the schedule is interpreted in.
  * @returns human-readable schedule text.
  */
 export function describeCron(expression: CronExpression, timeZone: string): string {
-  const fields = expression.text.split(/\s+/)
-  if (expression.text === '0 0 * * *') return `daily 00:00 ${timeZone}`
-  if (fields[0] === '0' && fields[1] === '*' && fields[2] === '*') return `hourly ${timeZone}`
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = expression.text.split(/\s+/)
+  const minuteNumber = plainNumber(minute)
+  const hourNumber = plainNumber(hour)
+  const minuteStep = stepOf(minute)
+  const hourStep = stepOf(hour)
+  const everyDay = dayOfMonth === '*' && month === '*' && dayOfWeek === '*'
+  if (everyDay) {
+    if (minute === '*' && hour === '*') return `every minute ${timeZone}`
+    if (minuteStep === 1 && hour === '*') return `every minute ${timeZone}`
+    if (minuteStep !== undefined && hour === '*') return `every ${minuteStep} minutes ${timeZone}`
+    if (hourStep !== undefined && minuteNumber !== undefined) {
+      return hourStep === 1
+        ? `hourly at :${pad(minuteNumber)} ${timeZone}`
+        : `every ${hourStep} hours at :${pad(minuteNumber)} ${timeZone}`
+    }
+    if (minuteNumber !== undefined && hour === '*') return `hourly at :${pad(minuteNumber)} ${timeZone}`
+    if (minuteNumber !== undefined && hourNumber !== undefined) return `daily ${pad(hourNumber)}:${pad(minuteNumber)} ${timeZone}`
+  }
   return `${expression.text} ${timeZone}`
+}
+
+/** A field that is nothing but a number, or undefined. */
+function plainNumber(field: string | undefined): number | undefined {
+  return field !== undefined && /^\d{1,2}$/.test(field) ? Number(field) : undefined
+}
+
+/** The step size of a `*​/n` field, or undefined for any other spelling. */
+function stepOf(field: string | undefined): number | undefined {
+  const match = field === undefined ? null : /^\*\/(\d{1,2})$/.exec(field)
+  return match === null ? undefined : Number(match[1])
+}
+
+/** Two-digit clock field. */
+function pad(value: number): string {
+  return String(value).padStart(2, '0')
 }

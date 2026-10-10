@@ -9,7 +9,7 @@
  * @module dsh-time-reminder/reading
  */
 
-import { latestOccurrence, type CronExpression } from './cron.ts'
+import { describeCron, latestOccurrence, type CronExpression } from './cron.ts'
 import type { CounterNoticeKind, CounterRecord, TimeMode } from './types.ts'
 
 export type { TimeMode } from './types.ts'
@@ -98,11 +98,8 @@ export function formatDuration(ms: number): string {
   return `${days}d${hours % 24}h`
 }
 
-/** Describe a schedule for the model-facing line. */
-export function describeSchedule(expression: CronExpression, timeZone: string): string {
-  if (expression.text === '0 0 * * *') return `daily 00:00 ${timeZone}`
-  return `${expression.text} ${timeZone}`
-}
+/** Describe a schedule for the model-facing line; one home, in `./cron.ts`. */
+export const describeSchedule = describeCron
 
 /**
  * Decide whether a `cron`-mode step is due.

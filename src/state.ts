@@ -17,6 +17,9 @@ export const timeReminderStateSchema = z.object({
   lastInjectionAt: z.number().nullable(),
   lastTurnInjectionAt: z.number().nullable(),
   lastMessageAt: z.number().nullable(),
+  // `readonly()` keeps the inferred output assignable to the state's readonly
+  // arrays; without it zod infers mutable arrays and the projection refuses the
+  // state it just validated.
   counters: z.array(z.object({
     name: z.string(),
     startedAt: z.number(),
@@ -27,10 +30,14 @@ export const timeReminderStateSchema = z.object({
       toParents: z.boolean(),
       depth: z.number(),
     }),
-  })),
+  }).readonly()).readonly(),
   pending: z.array(z.object({
     callId: z.string(),
     tool: z.string(),
     args: z.record(z.string(), z.unknown()),
-  })),
+    // Not decoration: zod strips undeclared keys, so a pending call that
+    // round-tripped through the projection cache would lose the instant its
+    // counter's baseline comes from.
+    at: z.number(),
+  }).readonly()).readonly(),
 })

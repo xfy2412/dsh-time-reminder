@@ -29,8 +29,14 @@ export interface CounterRecord {
   readonly name: string
   /** Baseline instant the elapsed time is measured from. */
   readonly startedAt: number
-  /** Free-form label shown beside the elapsed time. */
-  readonly note?: string
+  /**
+   * Free-form label shown beside the elapsed time.
+   *
+   * Declared `string | undefined` rather than plain `string`: the projection
+   * schema is a zod object whose inferred optional output carries `undefined`
+   * explicitly, and this record is the type that schema validates into.
+   */
+  readonly note?: string | undefined
   /** Whether this counter joins every automatic reading. */
   readonly inject: boolean
   readonly scope: CounterScope

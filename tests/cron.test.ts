@@ -95,6 +95,16 @@ test('latestOccurrence returns undefined for an empty window', () => {
 
 test('describeCron names the common schedules', () => {
   assert.equal(describeCron(parseCron('0 0 * * *'), ZONE), `daily 00:00 ${ZONE}`)
-  assert.equal(describeCron(parseCron('0 * * * *'), ZONE), `hourly ${ZONE}`)
+  assert.equal(describeCron(parseCron('30 3 * * *'), ZONE), `daily 03:30 ${ZONE}`)
+  assert.equal(describeCron(parseCron('0 * * * *'), ZONE), `hourly at :00 ${ZONE}`)
+  assert.equal(describeCron(parseCron('15 * * * *'), ZONE), `hourly at :15 ${ZONE}`)
+  assert.equal(describeCron(parseCron('* * * * *'), ZONE), `every minute ${ZONE}`)
+  assert.equal(describeCron(parseCron('*/2 * * * *'), ZONE), `every 2 minutes ${ZONE}`)
+  assert.equal(describeCron(parseCron('*/1 * * * *'), ZONE), `every minute ${ZONE}`)
+  assert.equal(describeCron(parseCron('0 */6 * * *'), ZONE), `every 6 hours at :00 ${ZONE}`)
+  assert.equal(describeCron(parseCron('30 */1 * * *'), ZONE), `hourly at :30 ${ZONE}`)
+  // A day, month, or weekday restriction keeps the raw expression: prose could
+  // drop a constraint the model would then plan against wrongly.
   assert.equal(describeCron(parseCron('30 8 * * 1-5'), ZONE), `30 8 * * 1-5 ${ZONE}`)
+  assert.equal(describeCron(parseCron('0 9 1 * *'), ZONE), `0 9 1 * * ${ZONE}`)
 })

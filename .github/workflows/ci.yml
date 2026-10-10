@@ -1,0 +1,27 @@
+# Verification for every push and pull request: the same three gates the release
+# runs, so a tag never publishes something CI has not already accepted.
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Build, typecheck, then the unit tests — the package's own `check`.
+      - run: pnpm run check

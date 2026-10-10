@@ -123,16 +123,18 @@ GUI 里那条折叠的"上下文注入"行**不展开就能读到"什么读数�
 ## 开发
 
 ```sh
-npm run build                      # src/*.ts → lib/*.js（装进 profile 前必须做）
-node --test tests/*.test.ts
-# 在受限沙箱里（子进程管道被拒）改用同进程隔离：
+pnpm run build                     # src/*.ts → lib/*.js（pack/publish 由 prepack 自动做）
+pnpm run typecheck                 # tsc --noEmit（peer 类型来自 devDependencies）
+pnpm test                          # node --test tests/*.test.ts
+pnpm run check                     # build + typecheck + test，一条龙
+# 在受限沙箱里（子进程管道被拒）跑用例改用同进程隔离：
 node --test --test-isolation=none tests/*.test.ts
 ```
 
 `lib/` 是**构建产物**（已在 `.gitignore` 里）：DSH 用裸 Node ESM 装载插件、没有 TypeScript 钩子，
-所以 `main: lib/index.js` 才是宿主真正加载的东西。`src/` 是唯一真源——**改完源码要 `npm run build`
-再装进 profile**，不要手改 `lib/`。
+所以 `main: lib/index.js` 才是宿主真正加载的东西。`src/` 是唯一真源——`pnpm pack` / `pnpm publish`
+会经 `prepack` 自动重建，不要手改 `lib/`。
 
-测试只覆盖纯逻辑模块（`cron.ts` / `reading.ts` / `visibility.ts` / `fold.ts`），
-不依赖 DSH 运行时，也不依赖 `zod`（投影 schema 在 `state.ts`，由宿主在装载时校验）。
-`src/index.ts` 需要 DSH 的 peer 依赖才能类型检查，目前尚未接入。
+测试只覆盖纯逻辑模块（`cron.ts` / `reading.ts` / `visibility.ts` / `fold.ts`），跑起来不依赖 DSH 运行时；
+类型检查覆盖 `src/` 与 `tests/` 全量（`tsconfig.json`：strict + `noUncheckedIndexedAccess` +
+`exactOptionalPropertyTypes`），peer 类型由 devDependencies 提供。

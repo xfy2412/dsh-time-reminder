@@ -17,9 +17,13 @@
  */
 
 import z from '@deepseek-ai/schemastery'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, type ContextFormed } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { Context } from '@deepseek-ai/cordis'
+// Load the projection package's declarations: the root carries the
+// `ctx.sessionProjections` service, `/types` the state map this file augments.
+import type {} from '@deepseek-ai/dsh-session-projection'
+import type {} from '@deepseek-ai/dsh-session-projection/types'
 import {
   canonicalTimeZone,
   counterNoticeText,
@@ -31,7 +35,7 @@ import {
   renderReading,
   systemReminderBlock,
 } from './reading.ts'
-import { parseCron } from './cron.ts'
+import { parseCron, type CronExpression } from './cron.ts'
 import {
   applySessionEvent,
   counterChange,
@@ -50,7 +54,26 @@ import { pushTargets, visibleCounters, type SessionFacts } from './visibility.ts
 /** Default schedule: once a day at 00:00 in the display zone. */
 const DEFAULT_CRON = '0 0 * * *'
 
-declare module '@deepseek-ai/dsh-session-projection' {
+/**
+ * Source fields of this plugin's injected context.
+ *
+ * `kind` answers who produced the message and `form` what it is: a reading is a
+ * `notice` (it records the collapsed-row summary), and a counter notice pushed
+ * from a related Session is a `relay` (it records the sender instead).
+ */
+interface TimeReminderMessageSource {
+  readonly kind: 'dsh-time-reminder'
+  /** Session that made the change a `relay` reports. */
+  readonly senderSessionId?: string
+}
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-time-reminder': TimeReminderMessageSource & ContextFormed
+  }
+}
+
+declare module '@deepseek-ai/dsh-session-projection/types' {
   interface SessionProjectionStateMap {
     'time-reminder': TimeReminderState
   }
@@ -316,7 +339,7 @@ export function apply(ctx: Context, config: Config): void {
         text: `Time mode is now ${value.mode} (schedule ${value.schedule}, zone ${value.timeZone}).\nCurrent time: ${value.now}\n${value.note}`,
       }],
     },
-    execute(args, exec) {
+    async execute(args, exec) {
       const session = requireSession(exec)
       const now = Date.now()
       // The same pure change the log fold applies, so a restored Session lands on
@@ -414,7 +437,7 @@ export function apply(ctx: Context, config: Config): void {
             + ` children=${counter.toChildren}; parents=${counter.toParents}; depth=${counter.depth}; origin=${counter.origin}]`).join('\n')}\n${value.note}`,
       }],
     },
-    execute(args, exec) {
+    async execute(args, exec) {
       const session = requireSession(exec)
       const now = Date.now()
       const zone = displayZone([])
