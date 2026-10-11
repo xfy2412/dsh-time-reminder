@@ -25,9 +25,12 @@ import { DEFAULT_COUNTER_SCOPE, type TimeReminderState } from '../src/types.ts'
 /** The state a fresh Session folds to. */
 const fresh = (): TimeReminderState => initialState('cron', '0 0 * * *')
 
+/** Zone the fold resolves a countdown's `at` argument in (the configured zone). */
+const ZONE = 'Asia/Shanghai'
+
 /** Fold a whole log. */
 const fold = (events: readonly SessionEventLike[], from = fresh()): TimeReminderState =>
-  events.reduce((state, event) => applySessionEvent(state, event), from)
+  events.reduce((state, event) => applySessionEvent(state, event, ZONE), from)
 
 /** One of this plugin's tool calls. */
 const call = (seq: number, time: number, name: string, args: Record<string, unknown>): SessionEventLike => ({
@@ -50,6 +53,22 @@ const reading = (time: number): SessionEventLike => ({
   data: { role: 'user', content: [{ type: 'text', text: 'Time sampled…' }], source: { kind: 'dsh-time-reminder', form: 'notice' } },
 })
 
+/**
+ * One countdown fire notice.
+ *
+ * It is a `notice` too, and that is the point: the `countdown` marker in the
+ * source is the only thing separating it from a reading.
+ */
+const fireNotice = (time: number, name: string): SessionEventLike => ({
+  type: 'user/message',
+  time,
+  data: {
+    role: 'user',
+    content: [{ type: 'text', text: `<system-reminder>[countdown] "${name}" has fired.</system-reminder>` }],
+    source: { kind: 'dsh-time-reminder', form: 'notice', countdown: name },
+  },
+})
+
 test('a successful time_mode call commits its mode and schedule', () => {
   const state = fold([
     call(1, 100, 'time_mode', { mode: 'turn' }),
@@ -64,7 +83,7 @@ test('time_mode commits a new cron expression only once its result arrives', () 
   const pending = fold([call(1, 100, 'time_mode', { mode: 'cron', cron: '*/5 * * * *' })])
   assert.equal(pending.cron, '0 0 * * *')
   assert.equal(pending.pending.length, 1)
-  const committed = applySessionEvent(pending, result(1, 110))
+  const committed = applySessionEvent(pending, result(1, 110), ZONE)
   assert.equal(committed.cron, '*/5 * * * *')
 })
 
@@ -121,8 +140,8 @@ test('counter note, scope, and remove follow the same call-then-result path', ()
   ])
   assert.equal(started.counters[0]?.note, '发布')
   assert.deepEqual(started.counters[0]?.scope, { toChildren: true, toParents: true, depth: 1 })
-  const removed = applySessionEvent(started, call(4, 4_000, 'time_counter', { action: 'remove', name: 'deploy' }))
-  assert.deepEqual(applySessionEvent(removed, result(4, 4_010)).counters, [])
+  const removed = applySessionEvent(started, call(4, 4_000, 'time_counter', { action: 'remove', name: 'deploy' }), ZONE)
+  assert.deepEqual(applySessionEvent(removed, result(4, 4_010), ZONE).counters, [])
 })
 
 test('a counter action naming a missing counter changes nothing', () => {
@@ -161,7 +180,7 @@ test('model-visible messages supply the step-1 baseline', () => {
 test('a turn boundary clears the open-turn reading and any unpaired call', () => {
   const before = fold([reading(7_000), call(1, 7_100, 'time_mode', { mode: 'fine' })])
   assert.equal(before.lastTurnInjectionAt, 7_000)
-  const after = applySessionEvent(before, { type: 'turn/end', time: 7_200, data: { turn: 1 } })
+  const after = applySessionEvent(before, { type: 'turn/end', time: 7_200, data: { turn: 1 } }, ZONE)
   assert.equal(after.lastTurnInjectionAt, null)
   assert.deepEqual(after.pending, [])
   assert.equal(after.lastInjectionAt, 7_000)
@@ -191,7 +210,94 @@ test('the fold covers every field the projection schema declares', () => {
     call(1, 1_100, 'time_counter', { action: 'start', name: 'deploy' }),
     result(1, 1_110),
   ])
-  assert.deepEqual(Object.keys(folded).sort(), ['counters', 'cron', 'lastInjectionAt', 'lastMessageAt', 'lastTurnInjectionAt', 'mode', 'pending'])
+  assert.deepEqual(Object.keys(folded).sort(), ['countdowns', 'counters', 'cron', 'lastInjectionAt', 'lastMessageAt', 'lastTurnInjectionAt', 'mode', 'pending'])
+})
+
+test('a countdown notice marks the countdown fired and never dates the reading baselines', () => {
+  const state = fold([
+    call(1, 1_000, 'time_countdown', { action: 'start', name: 'build', in: '1m' }),
+    result(1, 1_010),
+    fireNotice(61_000, 'build'),
+  ])
+  assert.equal(state.countdowns[0]?.firedAt, 61_000)
+  // The invariant that keeps a firing countdown from resetting the cron cadence:
+  assert.equal(state.lastInjectionAt, null)
+  assert.equal(state.lastTurnInjectionAt, null)
+})
+
+test('a countdown start commits relative to the instant its call was logged', () => {
+  const state = fold([
+    call(1, 1_000, 'time_countdown', { action: 'start', name: 'build', in: '10m' }),
+    result(1, 1_010),
+  ])
+  assert.equal(state.countdowns.length, 1)
+  // The baseline is the call's own instant, not the result's: the two paths (live
+  // tool and log fold) must agree, and only the call instant is in the log.
+  assert.equal(state.countdowns[0]?.firesAt, 601_000)
+  assert.equal(state.countdowns[0]?.setAt, 1_000)
+  assert.equal(state.countdowns[0]?.onFire, 'wake', 'waking is the default')
+  assert.equal(state.countdowns[0]?.firedAt, undefined)
+})
+
+test('a countdown commits only once its result reports success', () => {
+  const pending = fold([call(1, 1_000, 'time_countdown', { action: 'start', name: 'build', in: '10m' })])
+  assert.deepEqual(pending.countdowns, [])
+  assert.equal(pending.pending.length, 1)
+  assert.equal(applySessionEvent(pending, result(1, 1_010), ZONE).countdowns.length, 1)
+  const failed = fold([
+    call(1, 1_000, 'time_countdown', { action: 'start', name: 'build', in: '10m' }),
+    result(1, 1_010, true),
+  ])
+  assert.deepEqual(failed.countdowns, [])
+})
+
+test('a clock-time countdown resolves through the configured zone', () => {
+  // 2026-10-11T00:00:00Z is 08:00 in Shanghai, so 15:30 there is 07:30Z the same day.
+  const start = Date.parse('2026-10-11T00:00:00Z')
+  const state = fold([
+    call(1, start, 'time_countdown', { action: 'start', name: 'standup', at: '15:30', onFire: 'inject' }),
+    result(1, start + 10),
+  ])
+  assert.equal(new Date(state.countdowns[0]!.firesAt).toISOString(), '2026-10-11T07:30:00.000Z')
+  assert.equal(state.countdowns[0]?.onFire, 'inject')
+})
+
+test('snooze moves a fired countdown and clears its fire mark; cancel removes it', () => {
+  const fired = fold([
+    call(1, 1_000, 'time_countdown', { action: 'start', name: 'build', in: '10m' }),
+    result(1, 1_010),
+    fireNotice(601_000, 'build'),
+  ])
+  assert.equal(fired.countdowns[0]?.firedAt, 601_000)
+  const snoozed = fold([
+    call(2, 700_000, 'time_countdown', { action: 'snooze', name: 'build', in: '5m' }),
+    result(2, 700_010),
+  ], fired)
+  assert.equal(snoozed.countdowns[0]?.firesAt, 1_000_000)
+  assert.equal(snoozed.countdowns[0]?.firedAt, undefined, 'a snoozed countdown is pending again')
+  const cancelled = fold([
+    call(3, 800_000, 'time_countdown', { action: 'cancel', name: 'build' }),
+    result(3, 800_010),
+  ], snoozed)
+  assert.deepEqual(cancelled.countdowns, [])
+})
+
+test('a countdown action with unusable arguments is dropped instead of throwing', () => {
+  const state = fold([
+    call(1, 1_000, 'time_countdown', { action: 'start', name: 'no-time' }),
+    result(1, 1_010),
+    call(2, 2_000, 'time_countdown', { action: 'start', name: 'both', in: '1m', at: '10:00' }),
+    result(2, 2_010),
+    call(3, 3_000, 'time_countdown', { action: 'snooze', name: 'no-time' }),
+    result(3, 3_010),
+    call(4, 4_000, 'time_countdown', { action: 'cancel', name: 'ghost' }),
+    result(4, 4_010),
+    call(5, 5_000, 'time_countdown', { action: 'start', name: 'loud', in: '1m', onFire: 'shout' }),
+    result(5, 5_010),
+    call(6, 6_000, 'time_countdown', { action: 'nonsense', name: 'x' }),
+    result(6, 6_010),
+  ])
+  assert.deepEqual(state.countdowns, [])
 })
 
 test('a counter notice pushed from a related session is not a reading', () => {

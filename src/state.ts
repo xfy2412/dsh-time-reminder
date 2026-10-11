@@ -31,6 +31,14 @@ export const timeReminderStateSchema = z.object({
       depth: z.number(),
     }),
   }).readonly()).readonly(),
+  countdowns: z.array(z.object({
+    name: z.string(),
+    firesAt: z.number(),
+    setAt: z.number(),
+    onFire: z.union([z.literal('wake'), z.literal('inject')]),
+    note: z.string().optional(),
+    firedAt: z.number().optional(),
+  }).readonly()).readonly(),
   pending: z.array(z.object({
     callId: z.string(),
     tool: z.string(),

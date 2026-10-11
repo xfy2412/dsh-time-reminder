@@ -69,6 +69,58 @@ counters:
   否则这条通知会被当成"我刚读过时间"，把收件人的 cron 判定与 turn 节奏带偏。
 - 通知正文由 `counterNoticeText` 生成（纯函数、可单测），套 `<system-reminder>` 框后投递。
 
+## 倒计时（`time_countdown`）
+
+一次性定时器：`in`（相对时长）或 `at`（会话时区里的钟点，二者给且只给一个），到点做一件事。
+
+- **默认 `wake`，不是 `inject`**：倒计时的意义是"到点让事情发生"，而空闲会话不主动跑——
+  `inject` 只是把通知排进它下一步（可能永远等不到），`wake`（`agent.steer`）才会把它拉起来开一轮。
+  想省 token 的场合可以显式选 `inject`。
+- **触发凭据 = 那条通知本身**：通知来源带 `countdown` 标记（仍复用 `form: 'notice'`，因为它是"刚刚发生
+  的一件事"，客户端折叠行也需要 `summary`）。折叠看到它就给该倒计时盖上 `firedAt`，
+  于是重启不会重复触发，插件也不需要第二个存储，更不需要自造事件类型。
+- **通知绝不能算读数**：`foldUserMessage` 先查 `countdown` 标记再查 `form`——有标记就是"某倒计时已触发"，
+  没有才按读数记 `lastInjectionAt`。否则一次触发会顺手重置 cron/turn 节奏（这与推送通知用 `relay`
+  是同一类防护）。
+- **`at` 只在配置时区里解析**：折叠没有请求可读浏览器时区，若工具按浏览器时区、折叠按配置时区，
+  两者会算出不同的触发点，重启后就会重排一个已经触发过的倒计时。所以两条路径都用配置时区
+  （折叠把它当**入参**，见 `applySessionEvent(state, event, timeZone)`，而不是读环境）。
+- **定时器全部是重建出来的，不是持久化的**：宿主不存任何 job。三条重建路径——
+  插件装载时遍历驻留会话、会话每一步（pre-step）、以及每 60 秒的兜底扫描（覆盖"装载时投影还没驱动"
+  的会话）。超过 `setTimeout` 上限（≈24.8 天）的倒计时分段续排。
+- **错过的会补发**：装载时若 `firesAt` 已过，立即触发并在通知里写明迟了多久——模型若以为提醒是准时的
+  就会把后续安排算错。失败方向是**至少一次**（已投递但触发凭据尚未落盘的窗口里崩溃会重复一次），
+  与官方会话日志上传同一取向：宁可重复，绝不静默跳过。
+- **推迟原因必须"观察"，不能"推断"**：第一版把 `lateMs > 0` 当作"宿主没在运行"的证据，实测两次全是误判——
+  定时器只迟了几十毫秒（`formatDuration` 还把它渲染成误导性的 `0s late`），真正让通知晚到的是
+  **会话自己正卡在一个 155 秒的工具调用里**，通知只能等那一步结束。现在三个原因各有独立观测量：
+  武装时 `firesAt` 已过（补发）／回调迟到 ≥2s（进程被挂起或阻塞）／触发时 `agent.status === 'running'`
+  （会话在途，通知等步边界）。三者正交、可同时成立；都不成立时通知**不加任何解释**。
+- **冷会话靠 `sessionController.resolveAgent` 恢复**：`sessions.list()` 只列活会话、`sessions.get()`
+  不按需恢复，所以"宿主重启后把冷会话叫醒"必须另找一条缝——官方给的那条缝就是 Host Web 会话控制器的
+  `resolveAgent`（文档原话 "Resolve **or resume** one ordinary Session for another Host API domain"），
+  `dsh-schedule` 的投递正是走它（`schedule/src/runtime.ts:101`）。本项目按同一办法做：触发时若
+  `ctx.agents.get(id)` 取不到 Agent，就 `ctx.get('sessionController')?.resolveAgent(id)` 再回注册表取一次。
+  它是**可选服务**，所以走 `ctx.get` 而不是声明注入（仓库约定：可选服务用 `ctx.get`），
+  也因此在没有它的组合里（headless / 纯 SDK）倒计时只能等会话自己变活。
+  ⚠️ 实测补充（2026-10-11 调试日志）：**它可能比本插件挂得晚**。冷启动时插件加载那一刻
+  `verdict:"no-controller"`，20 秒后会话才由**客户端重连**恢复，投递虽成功但 `resumedHere:false`
+  ——不是我们做的。因此又注册了 `ctx.inject(['sessionController'], …)`：服务一出现就重新对账
+  （那才是"恢复成为可能"的时刻），否则只能等 60 秒扫描、甚至永远等不到。
+- **待办表：只当索引，不当真值**（`src/pending.ts`）：行 = `{sessionId, name, firesAt, onFire, note?, wroteAt}`，
+  存在 `<DSH_HOME>/time-reminder/countdowns.json`（Config 可改路径或关掉）。它只回答"哪些会话还欠倒计时"，
+  因为插件**看不见没被恢复的会话**（`sessions.list()` 只列活会话、`get()` 不恢复、没有枚举已存会话的 API）——
+  这正是"宿主重启 + 没人打开那个会话"这一格唯一能补上的办法。启动对账：读表 → 逐个 `resolveAgent` →
+  折叠日志判断 → 仍欠则武装、已触发/已取消/改期则删行或改行 → 做不到就留到下一轮（60 秒扫描也跑一次）。
+  解码手写（不引 zod）、坏行一律丢弃；写入 `tmp` + `rename`，写失败只 `warn`（提醒照常投递）。
+  于是"陈旧的表项凭空造出提醒"在结构上不可能：任何动作都以折叠结果为准。
+- **只有在真的投进收件箱之后才记账**：定时器回调是异步的（可能要等一次 resume），
+  成功才写进内存的 `delivered` 集合并把该行从待办表删掉；失败/抛错就保持 pending，
+  交给下一次 sync（步边界/扫描/对账）重试，绝不静默吞掉提醒。
+- **超阈值警告已删除**：先前 `remaining ≥ 10m` 会附一条"请去插件页启用官方 `自动化任务`"的警告。
+  有了待办表 + `resolveAgent` 之后长倒计时自己就能跨重启投递，那条警告只剩噪音，故整条移除；
+  剩下的唯一缺口（组合里没有 `sessionController` 时无法恢复会话）写进 README 的已知限制，不塞给模型。
+
 ## 状态如何落盘
 
 每会话状态（模式 + 计划 + 计数器 + 读数历史）**不写自己的事件类型**：DSH 0.2.0 的公开
@@ -82,6 +134,8 @@ API 无法给事件打 `ignorable` 标记（`Session.append()` 只接受 `surfac
 |---|---|---|
 | `mode` / `cron` | `tool/call` name=`time_mode` | 等配对的 `tool/result` 报告成功才采纳；参数非法则不采纳（工具当时也报错） |
 | `counters` | `tool/call` name=`time_counter` | 同上；新基准 = 该 `tool/call` 的 `time` |
+| `countdowns` | `tool/call` name=`time_countdown` | 同上；触发时刻按配置时区从调用时刻算出（`in` 加时长 / `at` 取下一次钟点） |
+| 倒计时"已触发" | `user/message`（`source.countdown`） | 插件自己投出的那条触发通知；`snooze` 会清掉该标记 |
 | `lastInjectionAt` / `lastTurnInjectionAt` | `user/message`（`source.kind = dsh-time-reminder`） | 就是插件自己注入的那条读数 |
 | `lastMessageAt` | `assistant/message` / `tool/result` | 步 1 的间隔基准 |
 | `pending`（在途调用） | `tool/call` → `tool/result` | `callId` 配对；失败即丢弃；`turn/start`/`turn/end` 清空 |
@@ -126,6 +180,7 @@ Elapsed since the preceding model-visible message: 187s
 |---|---|---|
 | `time_mode` | `mode: off \| cron \| turn \| fine`，可选 `cron`（cron 表达式） | 切换精度；改动由这次调用的调用/结果在日志里留痕 |
 | `time_counter` | `action: start \| lapse \| list \| note \| scope \| reset \| remove` | 建/查/改计时器；属性（注入、跨会话、父子可见、层数）在调用时设置 |
+| `time_countdown` | `action: start \| snooze \| cancel \| list`，`in`/`at`、`onFire: wake \| inject`、`note` | 一次性倒计时；默认到点唤醒本会话 |
 
 `lapse` 返回该计数器自基准以来的时长；`scope` 改可见性与是否注入。
 

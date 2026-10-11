@@ -26,11 +26,21 @@
  */
 
 import { parseCron } from './cron.ts'
-import { DEFAULT_COUNTER_SCOPE } from './types.ts'
-import type { CounterNoticeKind, CounterRecord, CounterScope, PendingCall, TimeMode, TimeReminderState } from './types.ts'
+import { parseDuration, resolveFiresAt, describeRemaining } from './countdown.ts'
+import { DEFAULT_COUNTER_SCOPE, DEFAULT_ON_FIRE } from './types.ts'
+import type {
+  CountdownOnFire,
+  CountdownRecord,
+  CounterNoticeKind,
+  CounterRecord,
+  CounterScope,
+  PendingCall,
+  TimeMode,
+  TimeReminderState,
+} from './types.ts'
 
-export type { CounterRecord, CounterScope, TimeMode, TimeReminderState } from './types.ts'
-export { DEFAULT_COUNTER_SCOPE } from './types.ts'
+export type { CountdownOnFire, CountdownRecord, CounterRecord, CounterScope, TimeMode, TimeReminderState } from './types.ts'
+export { DEFAULT_COUNTER_SCOPE, DEFAULT_ON_FIRE } from './types.ts'
 
 /**
  * Cordis plugin name, and the projection key / injected-message source.
@@ -49,6 +59,9 @@ export const TIME_MODE_TOOL = 'time_mode'
 /** Tool whose arguments carry a counter change. */
 export const TIME_COUNTER_TOOL = 'time_counter'
 
+/** Tool whose arguments carry a countdown change. */
+export const TIME_COUNTDOWN_TOOL = 'time_countdown'
+
 /**
  * Source form this plugin stamps on its automatic readings.
  *
@@ -61,6 +74,18 @@ export const READING_FORM = 'notice'
 
 /** Source form this plugin stamps on a counter notice delivered to a related Session. */
 export const PUSH_FORM = 'relay'
+
+/**
+ * Property a countdown notice carries in its source, naming the countdown that
+ * fired.
+ *
+ * Its presence is what separates a notice from a reading: both arrive as
+ * `user/message` from this plugin, but only a reading dates the injection
+ * baselines, so a firing countdown cannot reset the Session's cron or turn
+ * cadence — and the fold can tell that this countdown already fired, which is
+ * what keeps a restarted host from firing it twice.
+ */
+export const COUNTDOWN_SOURCE_FIELD = 'countdown'
 
 /**
  * How many unpaired tool calls the fold keeps. A call always receives a result
@@ -78,6 +103,7 @@ export function initialState(mode: TimeMode, cron: string): TimeReminderState {
     lastTurnInjectionAt: null,
     lastMessageAt: null,
     counters: [],
+    countdowns: [],
     pending: [],
   }
 }
@@ -231,6 +257,134 @@ export function counterChange(state: TimeReminderState, args: ToolArgs, at: numb
   }
 }
 
+/** Replace one countdown by name, or append it. Pure. */
+export function withCountdown(state: TimeReminderState, next: CountdownRecord): TimeReminderState {
+  const index = state.countdowns.findIndex((countdown) => countdown.name === next.name)
+  const countdowns = index < 0
+    ? [...state.countdowns, next]
+    : state.countdowns.map((countdown, at) => (at === index ? next : countdown))
+  return { ...state, countdowns }
+}
+
+/** Drop one countdown by name. Pure; returns the same reference when absent. */
+export function withoutCountdown(state: TimeReminderState, name: string): TimeReminderState {
+  const countdowns = state.countdowns.filter((countdown) => countdown.name !== name)
+  return countdowns.length === state.countdowns.length ? state : { ...state, countdowns }
+}
+
+/** Mark one countdown as fired at `at`. Pure; returns the same reference when nothing changes. */
+export function markCountdownFired(state: TimeReminderState, name: string, at: number): TimeReminderState {
+  const existing = state.countdowns.find((countdown) => countdown.name === name)
+  if (existing === undefined || existing.firedAt !== undefined) return state
+  return withCountdown(state, { ...existing, firedAt: at })
+}
+
+/** One countdown call's committed effect, plus the sentence describing it. */
+export interface CountdownChange {
+  readonly state: TimeReminderState
+  readonly note: string
+  /** The countdown as committed, when the call created, moved, or cancelled one. */
+  readonly countdown?: CountdownRecord
+  /** Whether the call changed which countdowns are pending, so the caller re-arms timers. */
+  readonly reschedule: boolean
+}
+
+/**
+ * Apply one `time_countdown` call to the state.
+ *
+ * The tool and the log fold share this function, so a restored Session reaches
+ * exactly the state the live call produced — including the instant a clock-time
+ * argument resolves to, which is why that resolution goes through the configured
+ * zone and never through a request's browser zone.
+ *
+ * @param state - state before the call.
+ * @param args - validated tool arguments.
+ * @param at - instant the call started; the baseline for a relative countdown.
+ * @param timeZone - configured zone an `at` argument is expressed in.
+ * @returns the state the call commits, with the sentence describing it.
+ * @throws TypeError when the action is unknown, a required argument is missing, or a named countdown does not exist.
+ */
+export function countdownChange(state: TimeReminderState, args: ToolArgs, at: number, timeZone: string): CountdownChange {
+  const action = String(args.action)
+  const name = typeof args.name === 'string' && args.name.length > 0 ? args.name : undefined
+  if (action !== 'list' && name === undefined) {
+    throw new TypeError(`${TIME_COUNTDOWN_TOOL}: action "${action}" requires a countdown name`)
+  }
+  const existing = name === undefined ? undefined : state.countdowns.find((countdown) => countdown.name === name)
+  switch (action) {
+    case 'start': {
+      const firesAt = resolveFiresAt({ in: textArgument(args.in), at: textArgument(args.at) }, at, timeZone)
+      const onFire = onFireFromArgs(args.onFire)
+      const next: CountdownRecord = {
+        name: name!,
+        firesAt,
+        setAt: at,
+        onFire,
+        ...typeof args.note === 'string' ? { note: args.note } : {},
+      }
+      return {
+        state: withCountdown(state, next),
+        note: `Countdown "${name}" is set for ${describeRemaining(firesAt, at)}${onFire === 'wake' ? ' and will wake this session' : ' and will be queued without waking this session'}.`,
+        countdown: next,
+        reschedule: true,
+      }
+    }
+    case 'snooze': {
+      requireCountdown(existing, name)
+      const duration = textArgument(args.in)
+      if (duration === undefined) throw new TypeError(`${TIME_COUNTDOWN_TOOL}: action "snooze" requires "in"`)
+      const firesAt = at + parseDuration(duration)
+      // Drop any previous fire mark: a snoozed countdown is pending again, and
+      // carrying `firedAt` over would leave it permanently un-armed.
+      const { firedAt: _previousFire, ...rest } = existing
+      const next: CountdownRecord = { ...rest, firesAt, setAt: at }
+      return {
+        state: withCountdown(state, next),
+        note: `Snoozed countdown "${name}"; it now fires ${describeRemaining(firesAt, at)}.`,
+        countdown: next,
+        reschedule: true,
+      }
+    }
+    case 'cancel':
+      requireCountdown(existing, name)
+      return {
+        state: withoutCountdown(state, name!),
+        note: `Cancelled countdown "${name}".`,
+        countdown: existing,
+        reschedule: true,
+      }
+    case 'list':
+      return {
+        state,
+        note: state.countdowns.some((countdown) => countdown.firedAt === undefined)
+          ? 'Countdowns fire once; "snooze" moves one, "cancel" removes it.'
+          : 'No countdown is pending; "start" sets one.',
+        reschedule: false,
+      }
+    default:
+      throw new TypeError(`${TIME_COUNTDOWN_TOOL}: unknown action ${JSON.stringify(action)}`)
+  }
+}
+
+/** Read one optional string argument, treating an empty string as absent. */
+function textArgument(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined
+}
+
+/** Read the `onFire` argument, defaulting to {@link DEFAULT_ON_FIRE}. */
+function onFireFromArgs(value: unknown): CountdownOnFire {
+  if (value === undefined) return DEFAULT_ON_FIRE
+  if (value !== 'wake' && value !== 'inject') {
+    throw new TypeError(`${TIME_COUNTDOWN_TOOL}: onFire must be "wake" or "inject", got ${JSON.stringify(value)}`)
+  }
+  return value
+}
+
+/** Refuse a countdown action whose named countdown is absent. */
+function requireCountdown(existing: CountdownRecord | undefined, name: string | undefined): asserts existing is CountdownRecord {
+  if (existing === undefined) throw new TypeError(`countdown "${name}" does not exist`)
+}
+
 /** The slice of a Session event the fold reads; structural so the fold needs no DSH runtime. */
 export interface SessionEventLike {
   readonly type: string
@@ -249,18 +403,17 @@ export interface SessionEventLike {
  *
  * @param state - state before this event.
  * @param event - the event to fold.
+ * @param timeZone - configured zone, the one a countdown's `at` argument resolves in.
  * @returns the state after this event.
  */
-export function applySessionEvent(state: TimeReminderState, event: SessionEventLike): TimeReminderState {
+export function applySessionEvent(state: TimeReminderState, event: SessionEventLike, timeZone: string): TimeReminderState {
   switch (event.type) {
     case 'tool/call':
       return foldToolCall(state, event)
     case 'tool/result':
-      return foldToolResult(state, event)
+      return foldToolResult(state, event, timeZone)
     case 'user/message':
-      return isPluginReading(event.data)
-        ? { ...state, lastInjectionAt: event.time, lastTurnInjectionAt: event.time }
-        : state
+      return foldUserMessage(state, event)
     case 'assistant/message':
       return state.lastMessageAt === event.time ? state : { ...state, lastMessageAt: event.time }
     case 'turn/start':
@@ -273,11 +426,30 @@ export function applySessionEvent(state: TimeReminderState, event: SessionEventL
   }
 }
 
+/**
+ * Fold one `user/message`.
+ *
+ * Two kinds of message matter, and they are disjoint by contract: an automatic
+ * reading dates the injection baselines that drive the cron and turn cadence,
+ * while a countdown notice carries {@link COUNTDOWN_SOURCE_FIELD} and marks that
+ * countdown as fired instead. A notice must never count as a reading, or firing a
+ * countdown would silently reset the Session's schedule.
+ */
+function foldUserMessage(state: TimeReminderState, event: SessionEventLike): TimeReminderState {
+  const source = asRecord(asRecord(event.data)?.source)
+  if (source?.kind !== PLUGIN_NAME) return state
+  const countdown = source[COUNTDOWN_SOURCE_FIELD]
+  if (typeof countdown === 'string') return markCountdownFired(state, countdown, event.time)
+  return source.form === READING_FORM
+    ? { ...state, lastInjectionAt: event.time, lastTurnInjectionAt: event.time }
+    : state
+}
+
 /** Record one of this plugin's tool calls until its result decides whether it commits. */
 function foldToolCall(state: TimeReminderState, event: SessionEventLike): TimeReminderState {
   const data = asRecord(event.data)
   const name = data?.name
-  if (name !== TIME_MODE_TOOL && name !== TIME_COUNTER_TOOL) return state
+  if (name !== TIME_MODE_TOOL && name !== TIME_COUNTER_TOOL && name !== TIME_COUNTDOWN_TOOL) return state
   const callId = data?.callId
   if (typeof callId !== 'string') return state
   let args: unknown
@@ -293,7 +465,7 @@ function foldToolCall(state: TimeReminderState, event: SessionEventLike): TimeRe
 }
 
 /** Commit a recorded call once its successful result arrives; drop it on failure. */
-function foldToolResult(state: TimeReminderState, event: SessionEventLike): TimeReminderState {
+function foldToolResult(state: TimeReminderState, event: SessionEventLike, timeZone: string): TimeReminderState {
   const data = asRecord(event.data)
   const message = asRecord(data?.message)
   const callId = message?.toolCallId
@@ -302,26 +474,20 @@ function foldToolResult(state: TimeReminderState, event: SessionEventLike): Time
   const call = base.pending.find((candidate) => candidate.callId === callId)
   if (call === undefined) return base
   const cleared: TimeReminderState = { ...base, pending: base.pending.filter((candidate) => candidate.callId !== callId) }
-  return message?.isError === true ? cleared : commitCall(cleared, call)
+  return message?.isError === true ? cleared : commitCall(cleared, call, timeZone)
 }
 
 /** Apply one recorded call, dropping it when its arguments cannot commit. */
-function commitCall(state: TimeReminderState, call: PendingCall): TimeReminderState {
+function commitCall(state: TimeReminderState, call: PendingCall, timeZone: string): TimeReminderState {
   try {
     if (call.tool === TIME_MODE_TOOL) return timeModeChange(state, call.args)
+    if (call.tool === TIME_COUNTDOWN_TOOL) return countdownChange(state, call.args, call.at, timeZone).state
     return counterChange(state, call.args, call.at).state
   } catch {
     // A call whose arguments cannot commit is a call that failed; the log keeps
     // no other trace of it, and the tool reported its own error to the model.
     return state
   }
-}
-
-/** Whether one event's data is this plugin's own automatic reading. */
-function isPluginReading(data: unknown): boolean {
-  const record = asRecord(data)
-  const source = asRecord(record?.source)
-  return source?.kind === PLUGIN_NAME && source?.form === READING_FORM
 }
 
 /** Narrow an unknown value to a plain object without casting. */

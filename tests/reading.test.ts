@@ -6,7 +6,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { canonicalTimeZone, counterNoticeText, cronDue, formatDuration, formatTimestamp, readingSummary, renderReading, systemReminderBlock } from '../src/reading.ts'
+import { canonicalTimeZone, countdownNoticeText, counterNoticeText, cronDue, formatDuration, formatTimestamp, readingSummary, renderReading, systemReminderBlock } from '../src/reading.ts'
 import { parseCron } from '../src/cron.ts'
 import { DEFAULT_COUNTER_SCOPE, type CounterRecord } from '../src/types.ts'
 
@@ -190,4 +190,89 @@ test('counterNoticeText covers every lifecycle change', () => {
   assert.match(counterNoticeText('relabelled', counter, 's', ZONE), /was relabelled by session s to "开始部署"/)
   assert.match(counterNoticeText('visibility', counter, 's', ZONE), /changed visibility \(children=true; parents=false; depth=2\); it joins your readings/)
   assert.match(counterNoticeText('removed', counter, 's', ZONE), /was removed by session s; it leaves your readings too/)
+})
+
+test('renderReading lists pending countdowns after the counters', () => {
+  const text = renderReading({
+    now: 1_000,
+    turn: 2,
+    step: 1,
+    zone: ZONE,
+    mode: 'turn',
+    cron: DAILY,
+    fresh: true,
+    sinceMessageMs: 5_000,
+    counters: [{ name: 'deploy', elapsedMs: 60_000 }],
+    countdowns: [
+      { name: 'build', inMs: 90_000 },
+      { name: 'standup', inMs: 3_600_000, note: 'daily sync' },
+    ],
+  })
+  const lines = text.split('\n')
+  assert.equal(lines.at(-1), '[countdowns] build in 1m30s  standup in 1h0m (daily sync)')
+  assert.ok(lines.at(-2)?.startsWith('[counters] deploy=1m0s'), 'counters keep their line above')
+})
+
+test('renderReading omits the countdown line when nothing is pending', () => {
+  const text = renderReading({
+    now: 1_000,
+    turn: 2,
+    step: 1,
+    zone: ZONE,
+    mode: 'turn',
+    cron: DAILY,
+    fresh: true,
+    counters: [],
+  })
+  assert.doesNotMatch(text, /\[countdowns\]/)
+})
+
+test('countdownNoticeText names the specific reason a fire was not on time', () => {
+  const firesAt = Date.parse('2026-10-09T01:23:45+08:00')
+  const due = 'was due at 2026-10-09T01:23:45+08:00[Asia/Shanghai] and has fired now.'
+  const onTime = { lateMs: 0, caughtUp: false, sessionBusy: false, resumedHere: false }
+  assert.equal(
+    countdownNoticeText('build', '看 Actions', firesAt, ZONE, onTime),
+    `[countdown] "build" (看 Actions) ${due}`,
+    'a punctual fire into an idle session has no delay to explain',
+  )
+  // Timer jitter is not lateness: `formatDuration` would render it as the
+  // misleading "0s late".
+  assert.equal(
+    countdownNoticeText('build', undefined, firesAt, ZONE, { ...onTime, lateMs: 30 }),
+    `[countdown] "build" ${due}`,
+  )
+  // The observable causes, each named as itself rather than as a possibility list:
+  assert.equal(
+    countdownNoticeText('build', undefined, firesAt, ZONE, { ...onTime, lateMs: 12 * 60_000, caughtUp: true }),
+    `[countdown] "build" ${due} It came due before this session's countdown timers were running again,`
+      + ' so this is the first chance to deliver it (12m0s late).',
+  )
+  assert.equal(
+    countdownNoticeText('build', undefined, firesAt, ZONE, { ...onTime, lateMs: 7_000 }),
+    `[countdown] "build" ${due} The timer went off 7s late, so the process was suspended or blocked at that instant.`,
+  )
+  assert.equal(
+    countdownNoticeText('build', undefined, firesAt, ZONE, { ...onTime, sessionBusy: true }),
+    `[countdown] "build" ${due} This session was in the middle of a step, so the notice waited for that step to end.`,
+  )
+  // The resume witness: only this plugin knows it sent the request, because a
+  // Session restored by the client reconnecting looks identical from outside.
+  assert.equal(
+    countdownNoticeText('build', undefined, firesAt, ZONE, { ...onTime, lateMs: 40_000, caughtUp: true, resumedHere: true }),
+    `[countdown] "build" ${due} It came due before this session's countdown timers were running again,`
+      + ' so this is the first chance to deliver it (40s late).'
+      + ' This session was not live, so this plugin asked the host to resume it in order to deliver the reminder.',
+  )
+  assert.doesNotMatch(
+    countdownNoticeText('build', undefined, firesAt, ZONE, { ...onTime, lateMs: 40_000, caughtUp: true }),
+    /asked the host to resume/,
+    'without the plugin\'s own resume request the notice must not claim one',
+  )
+  // Both can hold at once, and then both clauses appear.
+  assert.equal(
+    countdownNoticeText('build', undefined, firesAt, ZONE, { ...onTime, lateMs: 7_000, sessionBusy: true }),
+    `[countdown] "build" ${due} The timer went off 7s late, so the process was suspended or blocked at that instant.`
+      + ' This session was in the middle of a step, so the notice waited for that step to end.',
+  )
 })

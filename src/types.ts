@@ -52,6 +52,41 @@ export const DEFAULT_COUNTER_SCOPE: CounterScope = {
   depth: 2,
 }
 
+/** What happens when a countdown reaches its instant. */
+export type CountdownOnFire = 'wake' | 'inject'
+
+/**
+ * What a countdown does when it fires unless the call says otherwise.
+ *
+ * `wake` is the default because the point of a countdown is to make something
+ * happen at a time: a Session that is idle when its countdown fires is steered
+ * into a new turn, which is the only way the promised action actually runs.
+ * `inject` deliberately does not wake — it queues the notice for whenever the
+ * Session next takes a step.
+ */
+export const DEFAULT_ON_FIRE: CountdownOnFire = 'wake'
+
+/** One pending or fired countdown. */
+export interface CountdownRecord {
+  readonly name: string
+  /** Instant it fires (or fired). */
+  readonly firesAt: number
+  /** Instant this record was created or last snoozed. */
+  readonly setAt: number
+  /** What to do at `firesAt`. */
+  readonly onFire: CountdownOnFire
+  /** Free-form label carried into the notice. */
+  readonly note?: string | undefined
+  /**
+   * Instant the fire notice was logged, absent while the countdown is pending.
+   *
+   * The fold learns this from the notice itself rather than from a plugin-owned
+   * event: the delivered message is the durable record that the countdown fired,
+   * so a restarted host does not fire it a second time.
+   */
+  readonly firedAt?: number | undefined
+}
+
 /** What one counter call changed, as far as the related Sessions are concerned. */
 export type CounterNoticeKind = 'created' | 'restarted' | 'reset' | 'relabelled' | 'visibility' | 'removed'
 
@@ -78,6 +113,8 @@ export interface TimeReminderState {
   /** Instant of the latest model-visible message; the step-1 baseline. */
   readonly lastMessageAt: number | null
   readonly counters: readonly CounterRecord[]
+  /** Countdowns owned by this Session, pending and already fired. */
+  readonly countdowns: readonly CountdownRecord[]
   /** Calls awaiting their result; a call commits only when that result is a success. */
   readonly pending: readonly PendingCall[]
 }

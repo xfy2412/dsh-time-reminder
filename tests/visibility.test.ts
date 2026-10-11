@@ -35,6 +35,7 @@ const state = (...counters: CounterRecord[]): TimeReminderState => ({
   lastTurnInjectionAt: null,
   lastMessageAt: null,
   counters,
+  countdowns: [],
   pending: [],
 })
 

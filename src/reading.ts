@@ -20,10 +20,52 @@ const SYSTEM_REMINDER_OPEN = '<system-reminder>'
 /** Closing tag of that framing. */
 const SYSTEM_REMINDER_CLOSE = '</system-reminder>'
 
+/**
+ * How late a fire must be before the notice mentions it.
+ *
+ * A timer that goes off a few milliseconds after its instant is punctual; saying
+ * so in the notice would be noise, and `formatDuration` would render it as the
+ * misleading `0s late`.
+ */
+const LATE_NOTICE_MS = 2_000
+
+/**
+ * Why a countdown notice did not reach the model at the instant the countdown was due.
+ *
+ * Every field is something the plugin **observes** at fire time rather than
+ * guesses: `lateMs` is measured on the timer callback, `caughtUp` records that
+ * the timer was armed only after its instant had already passed, `sessionBusy` is
+ * the owning Agent's own status, and `resumedHere` is the plugin's own record of
+ * having asked the Host to resume this Session.
+ *
+ * `resumedHere` exists because a resumed Session looks identical from the outside
+ * no matter who asked for it — the client reconnecting, the user opening it, or
+ * this plugin's table reconcile all leave one `session/created` event. Only the
+ * plugin knows whether *it* sent the request, so only the plugin can say so.
+ */
+export interface CountdownFireCause {
+  /** Milliseconds the timer callback ran after `firesAt`; `0` when punctual. */
+  readonly lateMs: number
+  /** The timer was armed only once the instant had passed: nothing was running to fire it. */
+  readonly caughtUp: boolean
+  /** The owning Agent was mid-turn, so the notice waits for the next step boundary. */
+  readonly sessionBusy: boolean
+  /** This plugin asked the Host to resolve or resume the Session before delivering. */
+  readonly resumedHere: boolean
+}
+
 /** One counter scheduled to appear in the reading. */
 export interface CounterLine {
   readonly name: string
   readonly elapsedMs: number
+  readonly note?: string
+}
+
+/** One pending countdown, as the reading lists it so the model plans around it. */
+export interface CountdownLine {
+  readonly name: string
+  /** Milliseconds until it fires; negative once overdue. */
+  readonly inMs: number
   readonly note?: string
 }
 
@@ -57,6 +99,8 @@ export interface ReadingInput {
   readonly lastInjectionAt?: number
   /** Counters whose policy asks for automatic exposure. */
   readonly counters: readonly CounterLine[]
+  /** Pending countdowns, nearest first; the model sees what it has scheduled. */
+  readonly countdowns?: readonly CountdownLine[]
 }
 
 /** Canonicalize an IANA zone, or reject it. */
@@ -157,6 +201,10 @@ export function renderReading(input: ReadingInput): string {
     lines.push(`[counters] ${input.counters.map((counter) =>
       `${counter.name}=${formatDuration(counter.elapsedMs)}${counter.note === undefined ? '' : ` (${counter.note})`}`).join('  ')}`)
   }
+  if (input.countdowns !== undefined && input.countdowns.length > 0) {
+    lines.push(`[countdowns] ${input.countdowns.map((countdown) =>
+      `${countdown.name} in ${formatDuration(Math.max(0, countdown.inMs))}${countdown.note === undefined ? '' : ` (${countdown.note})`}`).join('  ')}`)
+  }
   return lines.join('\n')
 }
 
@@ -188,6 +236,56 @@ export function systemReminderBlock(text: string): string {
  */
 export function readingSummary(mode: TimeMode, at: number, timeZone: string): string {
   return `${mode} reading · ${formatTimestamp(at, timeZone)}`
+}
+
+/**
+ * Model-facing text of one countdown notice.
+ *
+ * It is the message the Session asked for when it set the countdown, so it says
+ * what the countdown was for, when it was due, and — when something kept it from
+ * arriving on time — the specific reason, because a model that believes a
+ * reminder is punctual will mis-plan the work around it.
+ *
+ * The reason comes from {@link CountdownFireCause}, which is observed rather than
+ * guessed: a timer armed after its instant means nothing was running to fire it;
+ * a late callback means the process was suspended or blocked; a running Agent
+ * means this Session was mid-step and the notice had to wait for that step to end.
+ * Those two can both be true, so the clauses are independent. A punctual fire into
+ * an idle Session adds nothing — there is no delay to explain.
+ *
+ * @param name - the countdown's name.
+ * @param note - the label the Session attached when setting it, if any.
+ * @param firesAt - the instant it was due.
+ * @param timeZone - resolved display zone.
+ * @param cause - what the plugin observed at fire time.
+ * @returns the notice body, without the `<system-reminder>` framing.
+ */
+export function countdownNoticeText(
+  name: string,
+  note: string | undefined,
+  firesAt: number,
+  timeZone: string,
+  cause: CountdownFireCause,
+): string {
+  const label = note === undefined ? '' : ` (${note})`
+  const clauses: string[] = []
+  if (cause.caughtUp) {
+    // Observed fact: the timer was armed only after the instant had passed. The
+    // reason is deliberately not narrowed to "the host was down" — the same
+    // observation also covers a session whose projection had not been driven yet
+    // when the plugin loaded, where the host was up all along.
+    clauses.push(`It came due before this session's countdown timers were running again, so this is the first chance to deliver it (${formatDuration(cause.lateMs)} late).`)
+  } else if (cause.lateMs >= LATE_NOTICE_MS) {
+    clauses.push(`The timer went off ${formatDuration(cause.lateMs)} late, so the process was suspended or blocked at that instant.`)
+  }
+  if (cause.sessionBusy) {
+    clauses.push('This session was in the middle of a step, so the notice waited for that step to end.')
+  }
+  if (cause.resumedHere) {
+    clauses.push('This session was not live, so this plugin asked the host to resume it in order to deliver the reminder.')
+  }
+  const reason = clauses.length === 0 ? '' : ` ${clauses.join(' ')}`
+  return `[countdown] "${name}"${label} was due at ${formatTimestamp(firesAt, timeZone)} and has fired now.${reason}`
 }
 
 /**

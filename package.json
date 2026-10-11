@@ -1,7 +1,7 @@
 {
   "name": "dsh-time-reminder",
-  "version": "0.1.0",
-  "description": "DSH 插件：可调精度的时钟上下文（off/cron/turn/fine）+ 会话内计时器（可见性可跨父子代理）",
+  "version": "0.2.0",
+  "description": "DSH 插件：可调精度的时钟上下文（off/cron/turn/fine）+ 会话内计时器（可见性可跨父子代理） + 跨重启可用倒计时器",
   "keywords": [
     "dsh",
     "deepseek-harness",
@@ -43,10 +43,11 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
-    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-session-projection": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-tools": "0.2.0-rc.2"
+    "@deepseek-ai/dsh-agent": ">=0.2.0-rc.2 <0.2.1-0",
+    "@deepseek-ai/dsh-llm": ">=0.2.0-rc.2 <0.2.1-0",
+    "@deepseek-ai/dsh-session": ">=0.2.0-rc.2 <0.2.1-0",
+    "@deepseek-ai/dsh-session-projection": ">=0.2.0-rc.2 <0.2.1-0",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.2 <0.2.1-0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": {
@@ -63,6 +64,9 @@
     },
     "@deepseek-ai/dsh-tools": {
       "optional": true
+    },
+    "@deepseek-ai/dsh-session": {
+      "optional": true
     }
   },
   "dependencies": {
@@ -77,6 +81,7 @@
     "@deepseek-ai/cordis": "~4.0.4",
     "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
     "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.0-rc.2",
     "@deepseek-ai/dsh-session-projection": "0.2.0-rc.2",
     "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
     "@types/node": "^26.6.4",
