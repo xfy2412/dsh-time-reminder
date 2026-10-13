@@ -136,6 +136,21 @@ Elapsed since the preceding model-visible message: 3m7s
 GUI 里那条折叠的"上下文注入"行**不展开就能读到"什么读数、什么时候"**，展开是完整读数。
 （官方 `@deepseek-ai/dsh-time-context` 用 `form: 'snapshot'`，它不记录摘要，折叠行只剩生产者名——读数在，但一眼看不见。）
 
+## 顶栏小钟（PoC）
+
+浏览器半边：**会话头部工具区**一枚小钟图标（挂在 `conversation.session.header.utilities` 槽位，
+`order: 118`，即 SSH 胶囊右侧），**鼠标悬停**展开一张卡片显示当前时间（每秒走动）、日期与浏览器时区。
+它只读本机时钟：**不发任何网络请求、不读会话数据**。
+
+产物是手写的 `client/index.js`（**不参与 TypeScript 构建**——`scripts/build.mjs` 只处理 `src/`），
+由 `package.json` 的 `dsh.client` 清单加载：`platform: web` + `inject` 列出所需的客户端包
+（`dsh-client-ui-slots` 提供槽位服务、`dsh-client-ui-conversation` 定义那个槽位），入口走
+`exports["./client"]`。**不需要在 `cordis.patch.yml` 里加行**——宿主行照旧，客户端半边靠清单发现
+（与已发布的 `dsh-ssh-remote` 同一套形态）。
+
+这是**最小可行性验证**：只为确认"客户端半边加载 + 槽位注册"这条通路可用。不需要时删掉
+`package.json` 里的 `dsh.client` 块（或整个 `client/` 目录）即可，宿主半边完全不受影响。
+
 正文里若出现 `</system-reminder>`（计数器备注是自由文本，可能带）会被转义成 `<\/system-reminder>`，防止提前闭合。
 
 ## 挂载
