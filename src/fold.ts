@@ -88,6 +88,64 @@ export const PUSH_FORM = 'relay'
 export const COUNTDOWN_SOURCE_FIELD = 'countdown'
 
 /**
+ * Property a GUI mode-change message carries in its source: the requested mode.
+ *
+ * The field, not the `form`, is what identifies the change — `ContextFormed` is a fixed
+ * harness union (`notice` / `relay` / `snapshot` / …) and refuses a producer-specific
+ * form, which is also why a countdown notice is marked by its own field instead. The
+ * fold checks this field *before* the reading branch, so the message cannot date the
+ * injection baselines even though it carries the `notice` form for the collapsed row.
+ *
+ * A value that is not one of the four modes is ignored rather than thrown on: this
+ * value comes out of a log, and a fold must never fail a whole Session over one
+ * unreadable field (the HTTP route validates before writing).
+ */
+export const MODE_SOURCE_FIELD = 'mode'
+
+/**
+ * Property a GUI mode-change message carries in its source: the new cron expression.
+ *
+ * Optional, and only meaningful beside {@link MODE_SOURCE_FIELD} — the same shape the
+ * `time_mode` tool takes (`mode` plus an optional `cron`), so the two paths cannot drift
+ * apart in what they accept. The fold tolerates an unparseable value; the HTTP route
+ * rejects it before writing.
+ */
+export const SCHEDULE_SOURCE_FIELD = 'cron'
+
+/**
+ * Whether a value names one of the four injection modes.
+ * @param value - value to test, of any type.
+ * @returns true when the value is a valid mode.
+ */
+export function isTimeMode(value: unknown): value is TimeMode {
+  return value === 'off' || value === 'cron' || value === 'turn' || value === 'fine'
+}
+
+/** Apply a validated mode, keeping the Session's cron expression and everything else. */
+function withMode(state: TimeReminderState, mode: TimeMode): TimeReminderState {
+  return state.mode === mode ? state : { ...state, mode }
+}
+
+/**
+ * Apply a mode change that came out of the log, together with its optional new schedule.
+ *
+ * Tolerant on purpose, unlike {@link timeModeChange}: the value was validated by the HTTP
+ * route before it was written, but it is read back from a log, and a fold must never fail
+ * a whole Session over one unreadable field. An unparseable expression leaves the old
+ * schedule in place instead of throwing.
+ */
+function withRequestedSchedule(state: TimeReminderState, mode: unknown, cron: unknown): TimeReminderState {
+  const next = isTimeMode(mode) ? withMode(state, mode) : state
+  if (typeof cron !== 'string' || cron.length === 0 || cron === next.cron) return next
+  try {
+    parseCron(cron)
+  } catch {
+    return next
+  }
+  return { ...next, cron }
+}
+
+/**
  * How many unpaired tool calls the fold keeps. A call always receives a result
  * before its turn ends, so this boundary only matters for a log that was cut
  * mid-turn.
@@ -160,14 +218,14 @@ export interface CounterChange {
  */
 export function timeModeChange(state: TimeReminderState, args: ToolArgs): TimeReminderState {
   const mode = args.mode
-  if (mode !== 'off' && mode !== 'cron' && mode !== 'turn' && mode !== 'fine') {
+  if (!isTimeMode(mode)) {
     throw new TypeError(`invalid time mode ${JSON.stringify(args.mode)}; expected off, cron, turn, or fine`)
   }
   const requested = typeof args.cron === 'string' && args.cron.length > 0 ? args.cron : undefined
   // Validate here rather than at the call site: the fold must reject exactly the
   // arguments the tool rejected, or the two would disagree after a restore.
   if (requested !== undefined) parseCron(requested)
-  return { ...state, mode, cron: requested ?? state.cron }
+  return { ...withMode(state, mode), cron: requested ?? state.cron }
 }
 
 /**
@@ -429,17 +487,27 @@ export function applySessionEvent(state: TimeReminderState, event: SessionEventL
 /**
  * Fold one `user/message`.
  *
- * Two kinds of message matter, and they are disjoint by contract: an automatic
- * reading dates the injection baselines that drive the cron and turn cadence,
- * while a countdown notice carries {@link COUNTDOWN_SOURCE_FIELD} and marks that
- * countdown as fired instead. A notice must never count as a reading, or firing a
- * countdown would silently reset the Session's schedule.
+ * Three kinds of message matter, and they are disjoint by contract: an automatic
+ * reading dates the injection baselines that drive the cron and turn cadence, a
+ * countdown notice carries {@link COUNTDOWN_SOURCE_FIELD} and marks that countdown as
+ * fired instead, and a GUI mode change carries {@link MODE_SOURCE_FIELD} and switches
+ * the mode. A notice must never count as a reading, or firing a countdown would
+ * silently reset the Session's schedule — and neither may a mode change, which would
+ * spend the reading the user just asked for.
  */
 function foldUserMessage(state: TimeReminderState, event: SessionEventLike): TimeReminderState {
   const source = asRecord(asRecord(event.data)?.source)
   if (source?.kind !== PLUGIN_NAME) return state
   const countdown = source[COUNTDOWN_SOURCE_FIELD]
   if (typeof countdown === 'string') return markCountdownFired(state, countdown, event.time)
+  // Checked before the reading branch, and by field rather than by form: the message
+  // carries the `notice` form so the GUI can show its summary, which is exactly the
+  // form a reading uses. A message carrying the field is therefore *never* a reading —
+  // even when its value is unreadable, so a corrupt one cannot reset the schedule.
+  const requested = source[MODE_SOURCE_FIELD]
+  if (requested !== undefined) {
+    return withRequestedSchedule(state, requested, source[SCHEDULE_SOURCE_FIELD])
+  }
   return source.form === READING_FORM
     ? { ...state, lastInjectionAt: event.time, lastTurnInjectionAt: event.time }
     : state

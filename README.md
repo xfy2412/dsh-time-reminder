@@ -136,20 +136,40 @@ Elapsed since the preceding model-visible message: 3m7s
 GUI 里那条折叠的"上下文注入"行**不展开就能读到"什么读数、什么时候"**，展开是完整读数。
 （官方 `@deepseek-ai/dsh-time-context` 用 `form: 'snapshot'`，它不记录摘要，折叠行只剩生产者名——读数在，但一眼看不见。）
 
-## 顶栏小钟（PoC）
+## 顶栏小钟
 
 浏览器半边：**会话头部工具区**一枚小钟图标（挂在 `conversation.session.header.utilities` 槽位，
-`order: 118`，即 SSH 胶囊右侧），**鼠标悬停**展开一张卡片显示当前时间（每秒走动）、日期与浏览器时区。
-它只读本机时钟：**不发任何网络请求、不读会话数据**。
+`order: 118`，即 SSH 胶囊右侧），**鼠标悬停**展开卡片：
+
+- **当前时间**（每秒走动）、日期星期、浏览器时区；
+- **本会话的时间提醒推送模式**：四个按钮（关闭 / 定时 / 每轮 / 每步），当前模式高亮，下面一行说明它的效果；
+  选到 `定时` 时多一个**计划表达式输入框**（回车或点"保存"提交，非法表达式由宿主回 `400 bad-cron` 并显示原因）；
+  改完显示"已请求，将在下一步生效"。
+
+模式是**每会话**的，所以卡片读写都带 `sessionId`（由会话作用域的槽位从框架那里拿到）。宿主侧两个路由：
+
+| 路由 | 作用 |
+|---|---|
+| `GET /time-reminder/api/state?sessionId=…` | 返回 `{ mode, cron, pending, live, timeZone, effect }` |
+| `POST /time-reminder/api/mode`（body `{ sessionId, mode, cron? }`） | 改模式，可选**同时改计划**（参数形状与 `time_mode` 工具一致）；会话不在驻留中回 `409 not-live`（先把会话打开再点），表达式非法回 `400 bad-cron` |
+
+两个路由都**只接受回环地址**（`Host` 为 `127.0.0.1` / `localhost` / `[::1]`，否则 `403`）：web 服务可能绑在
+局域网上，不能让别的设备翻你的模式。
+
+**切换怎么落到状态里**：不是另存一份设置，而是**写回会话日志**——宿主发一条本插件来源的消息（带 `mode`
+字段、用 `notice` 形式好让 GUI 那一行显示摘要），折叠把它当作与 `time_mode` 工具调用**完全一样**的模式变更 ✔。
+于是重放日志能得到同一个模式，没有第二份真值会漂移。它也**不算一次读数**（折叠里 `mode` 字段排在"读数"
+分支之前），否则切一下模式就把你要的那次读数吃掉了。
+
+**立即反馈**：`agent.inject` 是排队投递的（消息在下一个步边界才折进状态），所以卡片在日志追上来之前用一份
+2 分钟的内存"最近请求"覆盖显示——日志一旦一致就撤掉，它不参与任何持久状态。
 
 产物是手写的 `client/index.js`（**不参与 TypeScript 构建**——`scripts/build.mjs` 只处理 `src/`），
 由 `package.json` 的 `dsh.client` 清单加载：`platform: web` + `inject` 列出所需的客户端包
 （`dsh-client-ui-slots` 提供槽位服务、`dsh-client-ui-conversation` 定义那个槽位），入口走
 `exports["./client"]`。**不需要在 `cordis.patch.yml` 里加行**——宿主行照旧，客户端半边靠清单发现
-（与已发布的 `dsh-ssh-remote` 同一套形态）。
-
-这是**最小可行性验证**：只为确认"客户端半边加载 + 槽位注册"这条通路可用。不需要时删掉
-`package.json` 里的 `dsh.client` 块（或整个 `client/` 目录）即可，宿主半边完全不受影响。
+（与已发布的 `dsh-ssh-remote` 同一套形态）。宿主侧路由走 `ctx.inject(['webServer'], …)`
+（可选服务：headless 组合里没有它，插件照样加载 ✔）。
 
 正文里若出现 `</system-reminder>`（计数器备注是自由文本，可能带）会被转义成 `<\/system-reminder>`，防止提前闭合。
 

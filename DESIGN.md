@@ -133,6 +133,7 @@ API 无法给事件打 `ignorable` 标记（`Session.append()` 只接受 `surfac
 | 状态字段 | 来源事件 | 规则 |
 |---|---|---|
 | `mode` / `cron` | `tool/call` name=`time_mode` | 等配对的 `tool/result` 报告成功才采纳；参数非法则不采纳（工具当时也报错） |
+| `mode`（用户改的） | `user/message`（`source.mode`，可带 `source.cron`） | GUI 卡片点的那一下：宿主发一条本插件来源的消息，折叠按 `mode` **字段**识别（`form` 是 harness 固定联合，塞不进自定义值 ⇒ 与倒计时通知同一套：字段才是判据）。计划的编辑走同一个字段对（`mode` + 可选 `cron`），与 `time_mode` 工具的参数形状一致。**它不算读数**——`mode` 分支排在读数分支之前，且只要带了这个字段就永不落进读数分支（值坏了也一样），否则切模式会把你要的读数吃掉。日志里的非法表达式**忽略并保留旧计划**（折叠绝不能因为一个坏字段判死整个会话；HTTP 路由在写入前就拒绝了它） |
 | `counters` | `tool/call` name=`time_counter` | 同上；新基准 = 该 `tool/call` 的 `time` |
 | `countdowns` | `tool/call` name=`time_countdown` | 同上；触发时刻按配置时区从调用时刻算出（`in` 加时长 / `at` 取下一次钟点） |
 | 倒计时"已触发" | `user/message`（`source.countdown`） | 插件自己投出的那条触发通知；`snooze` 会清掉该标记 |

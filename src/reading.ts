@@ -289,6 +289,36 @@ export function countdownNoticeText(
 }
 
 /**
+ * What each mode means, in the words a notice and the tool result both use.
+ *
+ * @param mode - one of the four injection modes.
+ * @returns the clause describing when that mode injects a reading.
+ */
+export function describeMode(mode: TimeMode): string {
+  switch (mode) {
+    case 'off': return 'no automatic readings'
+    case 'cron': return 'a reading when the schedule is crossed'
+    case 'turn': return 'one reading at the first step of every turn'
+    case 'fine': return 'a reading at every step'
+  }
+}
+
+/**
+ * Model-facing notice that the **user** changed this Session's mode from the GUI card.
+ *
+ * The model is told because its cadence just changed and it cannot see why: one fewer or
+ * one extra reading would otherwise look like the plugin misbehaving. The line is short
+ * because it is context, not a task — and it names the mode's effect so the model does
+ * not have to remember what the four names mean.
+ *
+ * @param mode - the mode the user picked.
+ * @returns the notice body, without the `<system-reminder>` framing.
+ */
+export function modeNoticeText(mode: TimeMode): string {
+  return `[time] The user set this session's time mode to "${mode}" (${describeMode(mode)}).`
+}
+
+/**
  * Model-facing notice that a counter changed in a related Session.
  *
  * It is delivered to the Sessions a counter reaches or just left, so it states

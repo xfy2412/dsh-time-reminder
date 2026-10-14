@@ -18,10 +18,15 @@
 
 import { appendFile, mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage, type ContextFormed } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { Context } from '@deepseek-ai/cordis'
+// The web server is an optional service this plugin only *uses* through `ctx.inject`,
+// so its package is a type-only import: a headless composition has no such service and
+// must still load this plugin.
+import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 // Load the projection package's declarations: the root carries the
 // `ctx.sessionProjections` service, `/types` the state map this file augments.
 import type {} from '@deepseek-ai/dsh-session-projection'
@@ -35,9 +40,11 @@ import {
   countdownNoticeText,
   counterNoticeText,
   cronDue,
+  describeMode,
   describeSchedule,
   formatDuration,
   formatTimestamp,
+  modeNoticeText,
   readingSummary,
   renderReading,
   systemReminderBlock,
@@ -57,10 +64,14 @@ import {
   countdownChange,
   counterChange,
   initialState,
+  isTimeMode,
   timeModeChange,
   COUNTDOWN_SOURCE_FIELD,
+  MODE_SOURCE_FIELD,
   PLUGIN_NAME,
   PUSH_FORM,
+  READING_FORM,
+  SCHEDULE_SOURCE_FIELD,
   TIME_COUNTER_TOOL,
   TIME_COUNTDOWN_TOOL,
   TIME_MODE_TOOL,
@@ -83,8 +94,9 @@ const COUNTDOWN_LINE_LIMIT = 5
  * Source fields of this plugin's injected context.
  *
  * `kind` answers who produced the message and `form` what it is: a reading is a
- * `notice` (it records the collapsed-row summary), and a counter notice pushed
- * from a related Session is a `relay` (it records the sender instead).
+ * `notice` (it records the collapsed-row summary), a counter notice pushed from a
+ * related Session is a `relay` (it records the sender instead), and a mode change made
+ * from the GUI card is a `mode` (it carries the requested mode and is *not* a reading).
  */
 interface TimeReminderMessageSource {
   readonly kind: 'dsh-time-reminder'
@@ -98,6 +110,19 @@ interface TimeReminderMessageSource {
    * disturb the cron or turn cadence.
    */
   readonly countdown?: string
+  /**
+   * Mode the user picked in the GUI card, when this message is that change.
+   *
+   * Present only on a GUI change. The fold applies it and leaves the injection baselines
+   * alone, so switching the mode neither counts as nor consumes a reading.
+   */
+  readonly mode?: TimeMode
+  /**
+   * New cron expression the same GUI change asked for, when it edited the schedule too.
+   *
+   * The same pairing the `time_mode` tool takes: a mode plus an optional expression.
+   */
+  readonly cron?: string
 }
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -774,6 +799,180 @@ export function apply(ctx: Context, config: Config): void {
       delivered.clear()
     }
   }, 'time-reminder: countdown timers')
+
+  // ── browser-half HTTP API ──────────────────────────────────────────────────
+  // The GUI card reads and writes one Session's schedule through these two routes; a
+  // browser half cannot reach the service directly. Registered through `ctx.inject`
+  // because the web server is optional: a headless composition has none, and this
+  // plugin must still load there.
+
+  /** Path prefix both routes live under; the browser half hard-codes the same value. */
+  const API_PREFIX = '/time-reminder/api'
+
+  /** How long a change the user just made wins over the folded state while the log catches up. */
+  const MODE_OVERLAY_MS = 120_000
+
+  /**
+   * Schedule the user picked from the GUI card that the log has not recorded yet.
+   *
+   * `agent.inject` queues its message, and the fold only sees it once the message is
+   * spliced at a step boundary — minutes away on an idle Session. Without this overlay
+   * the card would show the old mode immediately after a click and look broken. The
+   * folded state wins as soon as it agrees, an entry expires after
+   * {@link MODE_OVERLAY_MS}, and nothing durable depends on it: the log stays the only
+   * source of truth.
+   */
+  const requestedSchedules = new Map<string, { mode: TimeMode; cron?: string; at: number }>()
+
+  /** The schedule to show for one Session: the user's latest intent, else the folded state. */
+  const shownSchedule = (sessionId: string): { mode: TimeMode; cron: string; pending: boolean } => {
+    const folded = stateOfId(sessionId)
+    const mode = folded?.mode ?? defaultMode
+    const cron = folded?.cron ?? configuredCron
+    const requested = requestedSchedules.get(sessionId)
+    if (requested === undefined) return { mode, cron, pending: false }
+    const agreed = requested.mode === mode && (requested.cron === undefined || requested.cron === cron)
+    if (agreed || Date.now() - requested.at > MODE_OVERLAY_MS) {
+      requestedSchedules.delete(sessionId)
+      return { mode, cron, pending: false }
+    }
+    return { mode: requested.mode, cron: requested.cron ?? cron, pending: true }
+  }
+
+  /** Write one JSON response; a route handler owns the whole response lifecycle. */
+  const respond = (res: ServerResponse, status: number, body: unknown): void => {
+    res.statusCode = status
+    res.setHeader('content-type', 'application/json; charset=utf-8')
+    res.setHeader('cache-control', 'no-store')
+    res.end(JSON.stringify(body))
+  }
+
+  /** Read a small JSON object body; unparseable, non-object, or oversized bodies reject. */
+  const readJson = async (req: IncomingMessage): Promise<Record<string, unknown>> => {
+    const chunks: Buffer[] = []
+    let size = 0
+    for await (const chunk of req) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))
+      size += buffer.length
+      if (size > 8 * 1024) throw new TypeError('request body too large')
+      chunks.push(buffer)
+    }
+    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new TypeError('body must be a JSON object')
+    }
+    return parsed as Record<string, unknown>
+  }
+
+  /** Answer one browser-half request. Loopback only, and every failure carries a reason. */
+  const handleApi = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    const host = String(req.headers.host ?? '')
+    // The web server can be bound to a LAN address, so the guard is on the request, not
+    // on the socket: another device must not be able to flip a Session's cadence.
+    if (!/^(127\.0\.0\.1|localhost|\[::1\])(:|$)/.test(host)) {
+      respond(res, 403, { ok: false, error: { code: 'forbidden', message: 'loopback only' } })
+      return
+    }
+    const url = new URL(req.url ?? '/', `http://${host}`)
+    const path = url.pathname.replace(/\/+$/, '')
+    try {
+      if (req.method === 'GET' && path === `${API_PREFIX}/state`) {
+        const sessionId = url.searchParams.get('sessionId') ?? ''
+        const resolved = shownSchedule(sessionId)
+        respond(res, 200, {
+          ok: true,
+          value: {
+            sessionId,
+            mode: resolved.mode,
+            cron: resolved.cron,
+            pending: resolved.pending,
+            live: ctx.agents.get(sessionId as never) !== undefined,
+            timeZone: displayZone([]),
+            effect: describeMode(resolved.mode),
+          },
+        })
+        return
+      }
+      if (req.method === 'POST' && path === `${API_PREFIX}/mode`) {
+        const body = await readJson(req)
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+        const requested = body.mode
+        if (sessionId === '') {
+          respond(res, 400, { ok: false, error: { code: 'bad-session', message: 'sessionId is required' } })
+          return
+        }
+        if (!isTimeMode(requested)) {
+          respond(res, 400, { ok: false, error: { code: 'bad-mode', message: 'mode must be off, cron, turn, or fine' } })
+          return
+        }
+        const agent = ctx.agents.get(sessionId as never)
+        if (agent === undefined) {
+          // Resuming a cold Session to flip a switch would start a turn's worth of work
+          // for a click; the card only exists on a Session the user is looking at.
+          respond(res, 409, { ok: false, error: { code: 'not-live', message: 'that session is not live; open it first' } })
+          return
+        }
+        // The change travels the same road as this plugin's other writes: a message from
+        // this plugin, folded into state. `notice` gives the GUI row its one-line summary.
+        // `cron` rides along exactly as it does on a `time_mode` call, so the card can
+        // edit the schedule without a second write path — or a second thing to validate.
+        const schedule = typeof body.cron === 'string' && body.cron.length > 0 ? body.cron : undefined
+        if (schedule !== undefined) {
+          try {
+            parseCron(schedule)
+          } catch (error: unknown) {
+            respond(res, 400, {
+              ok: false,
+              error: { code: 'bad-cron', message: error instanceof Error ? error.message : String(error) },
+            })
+            return
+          }
+        }
+        agent.inject(createUserMessage({
+          content: [{
+            type: 'text',
+            text: systemReminderBlock(`${modeNoticeText(requested)}${schedule === undefined ? '' : ` Schedule: ${schedule}.`}`),
+          }],
+          source: {
+            kind: PLUGIN_NAME,
+            form: READING_FORM,
+            [MODE_SOURCE_FIELD]: requested,
+            ...schedule === undefined ? {} : { [SCHEDULE_SOURCE_FIELD]: schedule },
+            summary: schedule === undefined ? `time mode · ${requested}` : `time mode · ${requested} · ${schedule}`,
+          },
+        }))
+        requestedSchedules.set(sessionId, { mode: requested, ...schedule === undefined ? {} : { cron: schedule }, at: Date.now() })
+        debug('mode.requested', { sessionId, mode: requested, cron: schedule })
+        respond(res, 200, {
+          ok: true,
+          value: {
+            sessionId,
+            mode: requested,
+            cron: schedule ?? stateOfId(sessionId)?.cron ?? configuredCron,
+            pending: true,
+            effect: describeMode(requested),
+          },
+        })
+        return
+      }
+      respond(res, 404, { ok: false, error: { code: 'not-found', message: `no route for ${req.method} ${path}` } })
+    } catch (error: unknown) {
+      respond(res, 400, {
+        ok: false,
+        error: { code: 'bad-request', message: error instanceof Error ? error.message : String(error) },
+      })
+    }
+  }
+
+  ctx.inject(['webServer' as never], (sctx) => {
+    const server = (sctx as unknown as { webServer: { register(route: WebRoute): () => void } }).webServer
+    sctx.effect(() => server.register({
+      kind: 'prefix',
+      path: API_PREFIX,
+      handler: (req, res) => { void handleApi(req, res).catch(() => undefined) },
+    }), 'time-reminder: http api')
+    debug('http.registered', { path: `${API_PREFIX}/state, ${API_PREFIX}/mode` })
+  })
 
   // ── tools (available in every mode, including `off`) ───────────────────────
   ctx.tools.register(defineTool({

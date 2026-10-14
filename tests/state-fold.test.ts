@@ -69,6 +69,65 @@ const fireNotice = (time: number, name: string): SessionEventLike => ({
   },
 })
 
+/**
+ * One mode change made by the user from the GUI card.
+ *
+ * It carries the `notice` form (so the GUI can show its one-line summary) and is
+ * identified by the `mode` field — the same shape as a countdown notice, and for the
+ * same reason: `ContextFormed` is a fixed harness union and refuses a producer form.
+ */
+const modeChange = (time: number, mode: string, cron?: string): SessionEventLike => ({
+  type: 'user/message',
+  time,
+  data: {
+    role: 'user',
+    content: [{ type: 'text', text: `<system-reminder>[time] The user set this session's time mode to "${mode}".</system-reminder>` }],
+    source: { kind: 'dsh-time-reminder', form: 'notice', mode, ...cron === undefined ? {} : { cron } },
+  },
+})
+
+test('a GUI mode change switches the mode without spending the reading baselines', () => {
+  const state = fold([
+    reading(1_000),
+    modeChange(2_000, 'fine'),
+  ])
+  assert.equal(state.mode, 'fine')
+  assert.equal(state.lastInjectionAt, 1_000, 'the switch itself is not a reading')
+  assert.equal(state.lastTurnInjectionAt, 1_000)
+  assert.equal(state.cron, '0 0 * * *', 'the schedule survives a mode switch')
+})
+
+test('a GUI mode change wins over the reading branch it shares a form with', () => {
+  // Same event, only the source differs: one is a reading, the other a mode change.
+  const asReading = fold([reading(5_000)])
+  const asMode = fold([modeChange(5_000, 'turn')])
+  assert.equal(asReading.mode, 'cron', 'the reading leaves the mode alone')
+  assert.equal(asReading.lastInjectionAt, 5_000)
+  assert.equal(asMode.mode, 'turn', 'the mode change switches the mode')
+  assert.equal(asMode.lastInjectionAt, null, 'and does not date the baselines')
+})
+
+test('an unreadable mode in the log is ignored rather than failing the fold', () => {
+  const state = fold([
+    reading(7_000),
+    modeChange(8_000, 'whenever'),
+  ])
+  assert.equal(state.mode, 'cron')
+  assert.equal(state.lastInjectionAt, 7_000, 'the message still counts as nothing at all')
+})
+
+test('a GUI mode change carries the new schedule the same way a time_mode call does', () => {
+  const state = fold([modeChange(2_000, 'cron', '*/5 * * * *')])
+  assert.equal(state.mode, 'cron')
+  assert.equal(state.cron, '*/5 * * * *')
+})
+
+test('an unreadable schedule in the log keeps the old one instead of failing the fold', () => {
+  const state = fold([modeChange(2_000, 'cron', 'every other tuesday')])
+  assert.equal(state.mode, 'cron', 'the mode still applies')
+  assert.equal(state.cron, '0 0 * * *', 'the unparseable expression is ignored')
+})
+
 test('a successful time_mode call commits its mode and schedule', () => {
   const state = fold([
     call(1, 100, 'time_mode', { mode: 'turn' }),
