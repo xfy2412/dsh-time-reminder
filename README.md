@@ -1,5 +1,8 @@
 # dsh-time-reminder
 
+（已被插件市场收录！！）
+[![Awesome DSH Plugin](https://awesome-dsh-plugin.com/badge.svg)](https://awesome-dsh-plugin.com)
+
 给 DSH 的模型一只**可调精度**的时钟，外加**会话内计时器**。
 
 ## 解决什么
